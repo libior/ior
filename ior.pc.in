@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: ior
+Description: Cross-platform io_uring-like async I/O library
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lior
+Libs.private: -lpthread
+Cflags: -I${includedir}

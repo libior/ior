@@ -1,0 +1,27 @@
+#ifndef IOR_CONFIG_H
+#define IOR_CONFIG_H
+
+/* Platform detection */
+#cmakedefine IOR_PLATFORM_LINUX
+#cmakedefine IOR_PLATFORM_FREEBSD
+#cmakedefine IOR_PLATFORM_OPENBSD
+#cmakedefine IOR_PLATFORM_MACOS
+#cmakedefine IOR_PLATFORM_WINDOWS
+
+/* Backend availability */
+#cmakedefine IOR_HAVE_URING
+#cmakedefine IOR_HAVE_IOCP
+
+/* Feature detection */
+#cmakedefine IOR_HAVE_EVENTFD
+
+/* Build options */
+#cmakedefine IOR_FORCE_PIPE
+
+/* Version info */
+#define IOR_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define IOR_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define IOR_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define IOR_VERSION_STRING "@PROJECT_VERSION@"
+
+#endif /* IOR_CONFIG_H */
