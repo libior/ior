@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Build options
 option(IOR_BUILD_TESTS "Build test programs" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
+option(IOR_FORCE_THREADS "Force thread backend even if io_uring available (testing)" OFF)
 option(IOR_FORCE_PIPE "Force pipe for thread event notification (testing)" OFF)
 
 # Platform detection
@@ -23,40 +24,113 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set(IOR_PLATFORM_WINDOWS TRUE)
 endif()
 
+# Check for C11 atomics (required)
+include(CheckIncludeFile)
+
+check_include_file("stdatomic.h" HAVE_STDATOMIC_H)
+if(NOT HAVE_STDATOMIC_H)
+    message(FATAL_ERROR "stdatomic.h not found - C11 atomics are required")
+endif()
+
+# Verify atomics actually work
+include(CheckCSourceCompiles)
+check_c_source_compiles("
+    #include <stdatomic.h>
+    int main() {
+        _Atomic int x = 0;
+        atomic_store_explicit(&x, 1, memory_order_release);
+        int y = atomic_load_explicit(&x, memory_order_acquire);
+        return y;
+    }
+" C11_ATOMICS_WORK)
+
+if(NOT C11_ATOMICS_WORK)
+    message(FATAL_ERROR "C11 atomics don't work - check your compiler")
+endif()
+
+message(STATUS "C11 atomics available")
+
+# Check for splice (Linux-specific)
+set(IOR_HAVE_SPLICE FALSE)
+if(IOR_PLATFORM_LINUX)
+    check_c_source_compiles("
+        #define _GNU_SOURCE
+        #include <fcntl.h>
+        #include <unistd.h>
+        int main() {
+            splice(0, NULL, 1, NULL, 0, 0);
+            return 0;
+        }
+    " HAVE_SPLICE)
+
+    if(HAVE_SPLICE)
+        set(IOR_HAVE_SPLICE TRUE)
+        message(STATUS "splice() available")
+    endif()
+endif()
+
 # Check for liburing on Linux
 set(IOR_HAVE_URING FALSE)
-if(IOR_PLATFORM_LINUX AND IOR_WITH_URING)
+set(IOR_URING_VERSION "unknown")
+
+if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
     find_package(PkgConfig)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(LIBURING liburing)
         if(LIBURING_FOUND)
-            set(IOR_HAVE_URING TRUE)
+            set(IOR_URING_VERSION ${LIBURING_VERSION})
             message(STATUS "Found liburing: ${LIBURING_VERSION}")
-        else()
-            message(STATUS "liburing not found via pkg-config, trying manual search")
-            # Try manual find
-            find_path(LIBURING_INCLUDE_DIR liburing.h)
-            find_library(LIBURING_LIBRARY uring)
-            if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+
+            # Test if liburing actually works
+            set(CMAKE_REQUIRED_INCLUDES ${LIBURING_INCLUDE_DIRS})
+            set(CMAKE_REQUIRED_LIBRARIES ${LIBURING_LIBRARIES})
+
+            check_c_source_compiles("
+                #include <liburing.h>
+                int main() {
+                    struct io_uring ring;
+                    struct io_uring_params params = {0};
+                    io_uring_queue_init_params(32, &ring, &params);
+                    io_uring_queue_exit(&ring);
+                    return 0;
+                }
+            " LIBURING_WORKS)
+
+            if(LIBURING_WORKS)
                 set(IOR_HAVE_URING TRUE)
-                set(LIBURING_INCLUDE_DIRS ${LIBURING_INCLUDE_DIR})
-                set(LIBURING_LIBRARIES ${LIBURING_LIBRARY})
-                message(STATUS "Found liburing manually")
+                message(STATUS "liburing is functional")
             else()
-                message(WARNING "liburing requested but not found - io_uring support disabled")
+                message(WARNING "liburing found but doesn't compile/link properly - disabling")
             endif()
+
+            unset(CMAKE_REQUIRED_INCLUDES)
+            unset(CMAKE_REQUIRED_LIBRARIES)
+        else()
+            message(STATUS "liburing not found via pkg-config")
         endif()
     else()
         message(WARNING "pkg-config not found, cannot detect liburing")
     endif()
+
+    if(NOT IOR_HAVE_URING)
+        message(STATUS "io_uring support disabled - will use thread backend")
+    endif()
+elseif(IOR_FORCE_THREADS)
+    message(STATUS "Forcing thread backend (IOR_FORCE_THREADS=ON)")
 endif()
 
 # Check for eventfd
 set(IOR_HAVE_EVENTFD FALSE)
 if((IOR_PLATFORM_LINUX OR IOR_PLATFORM_FREEBSD) AND NOT IOR_FORCE_PIPE)
-    include(CheckSymbolExists)
-    check_symbol_exists(eventfd "sys/eventfd.h" HAVE_EVENTFD_HEADER)
-    if(HAVE_EVENTFD_HEADER)
+    check_c_source_compiles("
+        #include <sys/eventfd.h>
+        int main() {
+            int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+            return fd >= 0 ? 0 : 1;
+        }
+    " HAVE_EVENTFD)
+
+    if(HAVE_EVENTFD)
         if(IOR_PLATFORM_FREEBSD)
             # FreeBSD has eventfd since version 13
             if(CMAKE_SYSTEM_VERSION VERSION_GREATER_EQUAL "13.0")
@@ -134,15 +208,22 @@ message(STATUS "  Platform: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  C Compiler: ${CMAKE_C_COMPILER_ID}")
 message(STATUS "")
 message(STATUS "Backends:")
-message(STATUS "  io_uring: ${IOR_HAVE_URING}")
+if(IOR_HAVE_URING)
+    message(STATUS "  io_uring: TRUE (version ${IOR_URING_VERSION})")
+else()
+    message(STATUS "  io_uring: FALSE")
+endif()
 message(STATUS "  Threads:  TRUE")
 if(IOR_PLATFORM_WINDOWS)
     message(STATUS "  IOCP:     ${IOR_HAVE_IOCP}")
 endif()
 message(STATUS "")
 message(STATUS "Features:")
-message(STATUS "  eventfd:  ${IOR_HAVE_EVENTFD}")
+message(STATUS "  eventfd:     ${IOR_HAVE_EVENTFD}")
+message(STATUS "  splice:      ${IOR_HAVE_SPLICE}")
 message(STATUS "")
 message(STATUS "Build Options:")
-message(STATUS "  Tests:    ${IOR_BUILD_TESTS}")
+message(STATUS "  Tests:         ${IOR_BUILD_TESTS}")
+message(STATUS "  Force threads: ${IOR_FORCE_THREADS}")
+message(STATUS "  Force pipe:    ${IOR_FORCE_PIPE}")
 message(STATUS "")

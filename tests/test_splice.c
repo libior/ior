@@ -1,8 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
 
 #ifdef __linux__
 

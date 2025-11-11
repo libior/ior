@@ -1,10 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <stdio.h>
 
 int setup_ior_ctx(void **state) {
     test_state *ts = calloc(1, sizeof(test_state));

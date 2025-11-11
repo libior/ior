@@ -103,8 +103,10 @@ int ior_uring_init(ior_ctx_uring **ctx_out, ior_params *params)
 		ctx->features |= IOR_FEAT_SQPOLL;
 	}
 
+#ifdef IOR_HAVE_SPLICE
 	// Check if splice is supported (Linux-specific)
 	ctx->features |= IOR_FEAT_SPLICE;
+#endif
 
 	params->features = ctx->features;
 

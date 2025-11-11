@@ -1,6 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+#include "config.h"
+#ifdef IOR_HAVE_SPLICE
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "ior_threads_pool.h"
-#include "ior_threads.h" // Changed from ior_backend_threads.h
+#include "ior_threads.h"
 #include "ior_threads_ring.h"
 #include "ior_threads_event.h"
 #include <stdlib.h>
@@ -307,12 +313,13 @@ static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
 
 		case IOR_OP_SPLICE: {
 			// Splice between two file descriptors
-#ifdef __linux__
+#ifdef IOR_HAVE_SPLICE
 			ssize_t ret = splice(sqe->splice_fd_in, (loff_t *) (sqe->addr ? &sqe->addr : NULL),
 					sqe->fd, (loff_t *) (sqe->off ? &sqe->off : NULL), sqe->len, sqe->splice_flags);
 			cqe.res = (ret < 0) ? -errno : ret;
 #else
 			// splice not available on non-Linux
+			// TODO: emulate it
 			cqe.res = -ENOSYS;
 #endif
 			break;

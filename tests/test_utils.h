@@ -5,8 +5,14 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cmocka.h>
-#include <ior/ior.h>
+#include "../src/ior.h"
 
 // Test fixture structure
 typedef struct test_state {

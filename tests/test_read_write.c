@@ -1,8 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
-#include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 // Test read operation
 static void test_read(void **state) {

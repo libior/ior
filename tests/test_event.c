@@ -2,7 +2,6 @@
 #include "test_utils.h"
 #include "../src/ior_threads_event.h"
 #include <pthread.h>
-#include <unistd.h>
 
 static void *signal_thread(void *arg) {
     ior_threads_event *event = (ior_threads_event *)arg;

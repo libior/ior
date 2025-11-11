@@ -14,9 +14,11 @@
 
 /* Feature detection */
 #cmakedefine IOR_HAVE_EVENTFD
+#cmakedefine IOR_HAVE_SPLICE
 
 /* Build options */
 #cmakedefine IOR_FORCE_PIPE
+#cmakedefine IOR_FORCE_THREADS
 
 /* Version info */
 #define IOR_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
