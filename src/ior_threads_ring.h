@@ -29,32 +29,32 @@ void ior_threads_ring_destroy(ior_threads_ring *ring);
 // Check if ring is empty
 static inline int ior_threads_ring_empty(ior_threads_ring *ring)
 {
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 	return head == tail;
 }
 
 // Check if ring is full
 static inline int ior_threads_ring_full(ior_threads_ring *ring)
 {
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 	return (tail - head) >= ring->size;
 }
 
 // Get number of available entries to consume
 static inline uint32_t ior_threads_ring_count(ior_threads_ring *ring)
 {
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 	return tail - head;
 }
 
 // Get available space for producing
 static inline uint32_t ior_threads_ring_space(ior_threads_ring *ring)
 {
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 	return ring->size - (tail - head);
 }
 

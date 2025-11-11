@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-3-Clause */
 #include "ior_threads_ring.h"
 #include <stdlib.h>
 #include <string.h>
@@ -57,8 +56,8 @@ ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring)
 	}
 
 	// Check if ring is full
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_relaxed(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
 
 	if (tail - head >= ring->size) {
 		return NULL; // Ring full
@@ -75,8 +74,8 @@ void ior_threads_ring_submit(ior_threads_ring *ring, uint32_t count)
 		return;
 	}
 
-	uint32_t tail = atomic_load_relaxed(&ring->tail);
-	atomic_store_release(&ring->tail, tail + count);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+	atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
 }
 
 ior_sqe *ior_threads_ring_peek_sqe(ior_threads_ring *ring)
@@ -85,8 +84,8 @@ ior_sqe *ior_threads_ring_peek_sqe(ior_threads_ring *ring)
 		return NULL;
 	}
 
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 
 	if (head == tail) {
 		return NULL; // Empty
@@ -102,8 +101,8 @@ void ior_threads_ring_consume_sqe(ior_threads_ring *ring)
 		return;
 	}
 
-	uint32_t head = atomic_load_relaxed(&ring->head);
-	atomic_store_release(&ring->head, head + 1);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+	atomic_store_explicit(&ring->head, head + 1, memory_order_release);
 }
 
 // ===== Completion Queue Operations =====
@@ -115,8 +114,8 @@ int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe)
 	}
 
 	// Check if ring is full
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_relaxed(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
 
 	if (tail - head >= ring->size) {
 		return -EOVERFLOW; // Ring full - should be rare with proper sizing
@@ -128,7 +127,7 @@ int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe)
 	cqes[idx] = *cqe;
 
 	// Publish by advancing tail
-	atomic_store_release(&ring->tail, tail + 1);
+	atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
 
 	return 0;
 }
@@ -139,8 +138,8 @@ ior_cqe *ior_threads_ring_peek_cqe(ior_threads_ring *ring)
 		return NULL;
 	}
 
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 
 	if (head == tail) {
 		return NULL; // Empty
@@ -156,8 +155,8 @@ void ior_threads_ring_cqe_seen(ior_threads_ring *ring)
 		return;
 	}
 
-	uint32_t head = atomic_load_relaxed(&ring->head);
-	atomic_store_release(&ring->head, head + 1);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+	atomic_store_explicit(&ring->head, head + 1, memory_order_release);
 }
 
 uint32_t ior_threads_ring_peek_batch_cqe(ior_threads_ring *ring, ior_cqe **cqes, uint32_t max)
@@ -166,8 +165,8 @@ uint32_t ior_threads_ring_peek_batch_cqe(ior_threads_ring *ring, ior_cqe **cqes,
 		return 0;
 	}
 
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 	uint32_t available = tail - head;
 
 	if (available == 0) {
@@ -190,8 +189,8 @@ void ior_threads_ring_advance(ior_threads_ring *ring, uint32_t count)
 		return;
 	}
 
-	uint32_t head = atomic_load_relaxed(&ring->head);
-	atomic_store_release(&ring->head, head + count);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+	atomic_store_explicit(&ring->head, head + count, memory_order_release);
 }
 
 // ===== Ring Expansion =====
@@ -207,8 +206,8 @@ int ior_threads_ring_resize(ior_threads_ring *ring, uint32_t new_size)
 	}
 
 	// Check if ring is empty (required for safe resize)
-	uint32_t head = atomic_load_acquire(&ring->head);
-	uint32_t tail = atomic_load_acquire(&ring->tail);
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 
 	if (head != tail) {
 		return -EBUSY; // Ring must be drained first
@@ -227,8 +226,8 @@ int ior_threads_ring_resize(ior_threads_ring *ring, uint32_t new_size)
 	ring->mask = new_size - 1;
 
 	// Reset indices
-	atomic_store_release(&ring->head, 0);
-	atomic_store_release(&ring->tail, 0);
+	atomic_store_explicit(&ring->head, 0, memory_order_release);
+	atomic_store_explicit(&ring->tail, 0, memory_order_release);
 
 	return 0;
 }
