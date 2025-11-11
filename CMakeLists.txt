@@ -5,6 +5,42 @@ project(ior VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Set default build type if not specified
+if(NOT CMAKE_BUILD_TYPE)
+	set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
+		"Choose the type of build: Debug Release RelWithDebInfo MinSizeRel" FORCE)
+endif()
+
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# Compiler flags per build type
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+	# Common warning flags
+	set(WARNING_FLAGS
+		-Wall
+		-Wextra
+		-Wpedantic
+		-Wno-unused-parameter
+	)
+
+	# Debug flags
+	set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
+
+	# Release flags
+	set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+
+	# Release with debug info
+	set(CMAKE_C_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
+
+	# Minimum size release
+	set(CMAKE_C_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+
+	# Add sanitizers option for debug builds
+	option(IOR_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+	option(IOR_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+	option(IOR_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+endif()
+
 # Build options
 option(IOR_BUILD_TESTS "Build test programs" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)

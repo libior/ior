@@ -52,6 +52,32 @@ target_include_directories(ior
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# Compiler flags
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+	target_compile_options(ior PRIVATE
+		-Wall
+		-Wextra
+		-Wpedantic
+		-Wno-unused-parameter
+	)
+
+	# Sanitizers
+	if(IOR_ENABLE_ASAN)
+		target_compile_options(ior PRIVATE -fsanitize=address)
+		target_link_options(ior PRIVATE -fsanitize=address)
+	endif()
+
+	if(IOR_ENABLE_UBSAN)
+		target_compile_options(ior PRIVATE -fsanitize=undefined)
+		target_link_options(ior PRIVATE -fsanitize=undefined)
+	endif()
+
+	if(IOR_ENABLE_TSAN)
+		target_compile_options(ior PRIVATE -fsanitize=thread)
+		target_link_options(ior PRIVATE -fsanitize=thread)
+	endif()
+endif()
+
 # Link libraries
 if(IOR_HAVE_URING)
     target_include_directories(ior PRIVATE ${LIBURING_INCLUDE_DIRS})
