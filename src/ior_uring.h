@@ -12,8 +12,14 @@
 // io_uring backend context
 typedef struct ior_ctx_uring {
 	struct io_uring ring; // Native io_uring
-	uint32_t flags; // Setup flags
-	uint32_t features; // Supported features
+
+	// Pending SQEs (ior format)
+	ior_sqe *pending_sqes;
+	uint32_t pending_count;
+	uint32_t pending_capacity;
+
+	uint32_t flags;
+	uint32_t features;
 } ior_ctx_uring;
 
 // Initialize io_uring backend

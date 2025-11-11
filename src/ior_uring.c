@@ -93,6 +93,18 @@ int ior_uring_init(ior_ctx_uring **ctx_out, ior_params *params)
 		return ret;
 	}
 
+	// Allocate pending SQE buffer (same size as submission queue)
+	ctx->pending_capacity = params->sq_entries;
+	ctx->pending_sqes = calloc(ctx->pending_capacity, sizeof(ior_sqe));
+	if (!ctx->pending_sqes) {
+		io_uring_queue_exit(&ctx->ring);
+		free(ctx);
+		return -ENOMEM;
+	}
+	ctx->pending_count = 0;
+
+	// Extract features
+	ctx->features = IOR_FEAT_NATIVE_ASYNC;
 	// Extract features
 	ctx->features = IOR_FEAT_NATIVE_ASYNC;
 
@@ -121,6 +133,7 @@ void ior_uring_destroy(ior_ctx_uring *ctx)
 	}
 
 	io_uring_queue_exit(&ctx->ring);
+	free(ctx->pending_sqes);
 	free(ctx);
 }
 
@@ -130,16 +143,17 @@ ior_sqe *ior_uring_get_sqe(ior_ctx_uring *ctx)
 		return NULL;
 	}
 
-	// Get io_uring sqe
-	struct io_uring_sqe *uring_sqe = io_uring_get_sqe(&ctx->ring);
-	if (!uring_sqe) {
+	// Check if we have space in pending buffer
+	if (ctx->pending_count >= ctx->pending_capacity) {
 		return NULL;
 	}
 
-	// Return as ior_sqe (they have compatible layout for basic fields)
-	// User will fill it in using ior_prep_* functions
-	// We'll convert to proper io_uring format on submit
-	return (ior_sqe *) uring_sqe;
+	// Return pointer to next pending SQE (in ior format)
+	ior_sqe *sqe = &ctx->pending_sqes[ctx->pending_count];
+	memset(sqe, 0, sizeof(*sqe));
+	ctx->pending_count++;
+
+	return sqe;
 }
 
 int ior_uring_submit(ior_ctx_uring *ctx)
@@ -148,9 +162,28 @@ int ior_uring_submit(ior_ctx_uring *ctx)
 		return -EINVAL;
 	}
 
-	// For io_uring, we can submit directly since the SQE layout is compatible
-	// The ior_prep_* functions write the fields that io_uring expects
+	if (ctx->pending_count == 0) {
+		return 0;
+	}
+
+	// Convert all pending ior_sqe entries to io_uring_sqe
+	for (uint32_t i = 0; i < ctx->pending_count; i++) {
+		struct io_uring_sqe *uring_sqe = io_uring_get_sqe(&ctx->ring);
+		if (!uring_sqe) {
+			// Ring full - should not happen if sizes match
+			return -ENOSPC;
+		}
+
+		// Convert ior_sqe to io_uring_sqe
+		ior_to_uring_sqe(uring_sqe, &ctx->pending_sqes[i]);
+	}
+
+	// Submit to kernel
 	int ret = io_uring_submit(&ctx->ring);
+
+	// Clear pending buffer
+	ctx->pending_count = 0;
+
 	return ret < 0 ? -errno : ret;
 }
 
@@ -160,6 +193,19 @@ int ior_uring_submit_and_wait(ior_ctx_uring *ctx, unsigned wait_nr)
 		return -EINVAL;
 	}
 
+	// First convert and prepare submissions
+	if (ctx->pending_count > 0) {
+		for (uint32_t i = 0; i < ctx->pending_count; i++) {
+			struct io_uring_sqe *uring_sqe = io_uring_get_sqe(&ctx->ring);
+			if (!uring_sqe) {
+				return -ENOSPC;
+			}
+			ior_to_uring_sqe(uring_sqe, &ctx->pending_sqes[i]);
+		}
+		ctx->pending_count = 0;
+	}
+
+	// Submit and wait
 	int ret = io_uring_submit_and_wait(&ctx->ring, wait_nr);
 	return ret < 0 ? -errno : ret;
 }
