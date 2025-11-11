@@ -1,0 +1,37 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+# Top-most EditorConfig file
+root = true
+
+# Defaults for all files
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# C/C++ source files - use tabs (matches .clang-format)
+[*.{c,h}]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+# CMake files - use spaces (CMake convention)
+[{CMakeLists.txt,*.cmake}]
+indent_style = space
+indent_size = 4
+
+# Markdown files
+[*.md]
+trim_trailing_whitespace = false
+
+# YAML files (for GitHub Actions, etc.)
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# JSON files
+[*.json]
+indent_style = space
+indent_size = 2
+
