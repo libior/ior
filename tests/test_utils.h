@@ -16,9 +16,9 @@
 
 // Test fixture structure
 typedef struct test_state {
-    ior_ctx *ctx;
-    int test_fd;
-    char *temp_file;
+	ior_ctx *ctx;
+	int test_fd;
+	char *temp_file;
 } test_state;
 
 // Setup/teardown helpers
