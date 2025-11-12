@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <cmocka.h>
+#include "config.h"
 #include "../src/ior.h"
 
 // Test fixture structure

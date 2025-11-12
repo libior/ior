@@ -224,18 +224,7 @@ static void ior_uring_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_
 		uint64_t off_out, unsigned nbytes, unsigned flags)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
-#ifdef IORING_OP_SPLICE
 	io_uring_prep_splice(s, fd_in, off_in, fd_out, off_out, nbytes, flags);
-#else
-	(void) fd_in;
-	(void) off_in;
-	(void) fd_out;
-	(void) off_out;
-	(void) nbytes;
-	(void) flags;
-	memset(s, 0, sizeof(*s));
-	s->opcode = 0xFF; // Invalid opcode
-#endif
 }
 
 static void ior_uring_backend_prep_timeout(

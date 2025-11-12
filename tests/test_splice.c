@@ -24,7 +24,7 @@ static void test_splice_basic(void **state)
 	ior_sqe *sqe = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe);
 
-	ior_prep_splice(ts->ctx, sqe, ts->test_fd, 0, pipefd[1], -1, len, 0);
+	ior_prep_splice(ts->ctx, sqe, ts->test_fd, 0, pipefd[1], IOR_SPLICE_OFF_NONE, len, 0);
 	ior_sqe_set_data(ts->ctx, sqe, NULL);
 
 	ret = ior_submit_and_wait(ts->ctx, 1);
