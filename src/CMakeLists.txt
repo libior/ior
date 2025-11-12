@@ -54,29 +54,17 @@ target_include_directories(ior
 
 # Compiler flags
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-	target_compile_options(ior PRIVATE
-		-Wall
-		-Wextra
-		-Wpedantic
-		-Wno-unused-parameter
-	)
+    target_compile_options(ior PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wno-unused-parameter
+    )
 
-	# Sanitizers
-	if(IOR_ENABLE_ASAN)
-		target_compile_options(ior PRIVATE -fsanitize=address)
-		target_link_options(ior PRIVATE -fsanitize=address)
-	endif()
-
-	if(IOR_ENABLE_UBSAN)
-		target_compile_options(ior PRIVATE -fsanitize=undefined)
-		target_link_options(ior PRIVATE -fsanitize=undefined)
-	endif()
-
-	if(IOR_ENABLE_TSAN)
-		target_compile_options(ior PRIVATE -fsanitize=thread)
-		target_link_options(ior PRIVATE -fsanitize=thread)
-	endif()
+    # Apply sanitizers
+    apply_sanitizers(ior)
 endif()
+
 
 # Link libraries
 if(IOR_HAVE_URING)
@@ -90,16 +78,6 @@ if(NOT IOR_PLATFORM_WINDOWS)
 else()
     # Windows needs different libs
     target_link_libraries(ior PRIVATE ws2_32)
-endif()
-
-# Compiler flags
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(ior PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-        -Wno-unused-parameter
-    )
 endif()
 
 # Installation

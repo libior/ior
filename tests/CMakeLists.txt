@@ -11,6 +11,7 @@ target_include_directories(test_utils
         ${CMAKE_BINARY_DIR}
 )
 target_link_libraries(test_utils PUBLIC ior cmocka::cmocka)
+apply_sanitizers(test_utils)
 
 # Test executables
 set(TESTS
@@ -33,6 +34,7 @@ foreach(test ${TESTS})
         ${CMAKE_BINARY_DIR}
     )
     target_link_libraries(${test} PRIVATE test_utils ior cmocka::cmocka)
+    apply_sanitizers(${test})
 
     # Add to CTest
     add_test(NAME ${test} COMMAND ${test})
@@ -48,6 +50,7 @@ target_include_directories(test_threads_backend PRIVATE
     ${CMAKE_BINARY_DIR}
 )
 target_link_libraries(test_threads_backend PRIVATE test_utils ior cmocka::cmocka)
+apply_sanitizers(test_threads_backend)
 add_test(NAME test_threads_backend COMMAND test_threads_backend)
 set_tests_properties(test_threads_backend PROPERTIES TIMEOUT 30)
 
@@ -59,6 +62,7 @@ if(IOR_HAVE_URING)
         ${CMAKE_BINARY_DIR}
     )
     target_link_libraries(test_uring_backend PRIVATE test_utils ior cmocka::cmocka)
+    apply_sanitizers(test_uring_backend)
     add_test(NAME test_uring_backend COMMAND test_uring_backend)
     set_tests_properties(test_uring_backend PROPERTIES TIMEOUT 30)
 endif()

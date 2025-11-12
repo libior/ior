@@ -41,6 +41,28 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 	option(IOR_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 endif()
 
+# Helper function to apply sanitizer flags to a target
+# Define unconditionally so it can always be called
+function(apply_sanitizers target)
+	if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+		if(IOR_ENABLE_ASAN)
+			target_compile_options(${target} PRIVATE -fsanitize=address)
+			target_link_options(${target} PRIVATE -fsanitize=address)
+		endif()
+
+		if(IOR_ENABLE_UBSAN)
+			target_compile_options(${target} PRIVATE -fsanitize=undefined)
+			target_link_options(${target} PRIVATE -fsanitize=undefined)
+		endif()
+
+		if(IOR_ENABLE_TSAN)
+			target_compile_options(${target} PRIVATE -fsanitize=thread)
+			target_link_options(${target} PRIVATE -fsanitize=thread)
+		endif()
+	endif()
+	# For other compilers, this function does nothing
+endfunction()
+
 # Build options
 option(IOR_BUILD_TESTS "Build test programs" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
