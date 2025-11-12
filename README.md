@@ -15,60 +15,48 @@ The goal is to provide maximum performance on platforms with native async I/O su
 ## Features
 
 ### Current (Stage 1)
-- ✅ Read operations
-- ✅ Write operations  
-- ✅ Timer/timeout operations
-- ✅ Splice operations (Linux)
-- ✅ Thread pool emulation backend
-- ✅ Linux io_uring backend (with liburing)
-- ✅ eventfd-based notification (Linux/FreeBSD 13+)
-- ✅ Pipe-based notification fallback
+- Read operations
+- Write operations  
+- Timer/timeout operations
+- Splice operations (Linux)
+- Thread pool emulation backend
+- Linux io_uring backend (with liburing)
+- eventfd-based notification (Linux/FreeBSD 13+)
+- Pipe-based notification fallback
 
 ### Planned (Stage 2)
-- 🔄 Accept operations
-- 🔄 Connect operations
-- 🔄 Bind operations
-- 🔄 Listen operations
-- 🔄 Windows IOCP backend
-- 🔄 Additional io_uring operations
+- Accept operations
+- Connect operations
+- Bind operations
+- Listen operations
+- Windows IOCP backend
+- Additional io_uring operations
 
 ## Building
 
-### Requirements
+For detailed build instructions, options, and troubleshooting, see [BUILD.md](BUILD.md).
 
-- CMake 3.15 or later
-- C11-compatible compiler
-- POSIX threads (Unix/Linux)
-- liburing (optional, for native io_uring support on Linux)
-
-### Basic Build
+### Quick Start
 ```bash
-# Clone the repository
-git clone https://github.com/libior/ior.git
+# Clone and build
+git clone https://github.com/yourusername/ior.git
 cd ior
-
-# Build with defaults
 cmake -B build
 cmake --build build
+
+# Run tests
+ctest --test-dir build --output-on-failure
 
 # Install
 sudo cmake --build build --target install
 ```
 
-### Build Options
-```bash
-# Build without io_uring (thread backend only)
-cmake -B build -DIOR_WITH_URING=OFF
+### Requirements
 
-# Force pipe-based notification (for testing)
-cmake -B build -DIOR_FORCE_PIPE=ON
-
-# Build without tests
-cmake -B build -DIOR_BUILD_TESTS=OFF
-
-# Release build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-```
+- CMake 3.15+
+- C11 compiler (GCC, Clang, MSVC)
+- POSIX threads
+- **Optional:** liburing (Linux), cmocka (tests)
 
 ## Usage
 

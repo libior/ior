@@ -1,64 +1,29 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "config.h"
-#include "ior_uring.h"
 
 #ifdef IOR_HAVE_URING
 
+#include "ior_backend.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <liburing.h>
 
-// Convert ior_sqe to io_uring_sqe
-static inline void ior_to_uring_sqe(struct io_uring_sqe *uring_sqe, const ior_sqe *ior_sqe)
+/* Backend context */
+typedef struct ior_ctx_uring {
+	struct io_uring ring;
+	uint32_t flags;
+	uint32_t features;
+} ior_ctx_uring;
+
+/* Backend operations */
+
+static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 {
-	// Zero out the io_uring sqe first
-	memset(uring_sqe, 0, sizeof(*uring_sqe));
-
-	// Copy fields - most map directly
-	uring_sqe->opcode = ior_sqe->opcode;
-	uring_sqe->flags = ior_sqe->flags;
-	uring_sqe->ioprio = ior_sqe->ioprio;
-	uring_sqe->fd = ior_sqe->fd;
-	uring_sqe->off = ior_sqe->off;
-	uring_sqe->addr = ior_sqe->addr;
-	uring_sqe->len = ior_sqe->len;
-	uring_sqe->user_data = ior_sqe->user_data;
-
-	// Copy union fields based on operation
-	switch (ior_sqe->opcode) {
-		case IOR_OP_READ:
-		case IOR_OP_WRITE:
-			uring_sqe->rw_flags = ior_sqe->rw_flags;
-			break;
-		case IOR_OP_SPLICE:
-			uring_sqe->splice_flags = ior_sqe->splice_flags;
-			uring_sqe->splice_fd_in = ior_sqe->splice_fd_in;
-			break;
-		case IOR_OP_TIMER:
-			uring_sqe->timeout_flags = ior_sqe->timeout_flags;
-			break;
-	}
-
-	uring_sqe->buf_index = ior_sqe->buf_index;
-	uring_sqe->personality = ior_sqe->personality;
-	uring_sqe->file_index = ior_sqe->file_index;
-}
-
-// Convert io_uring_cqe to ior_cqe
-static inline void uring_to_ior_cqe(ior_cqe *ior_cqe, const struct io_uring_cqe *uring_cqe)
-{
-	ior_cqe->user_data = uring_cqe->user_data;
-	ior_cqe->res = uring_cqe->res;
-	ior_cqe->flags = uring_cqe->flags;
-}
-
-int ior_uring_init(ior_ctx_uring **ctx_out, ior_params *params)
-{
-	if (!ctx_out || !params) {
+	if (!backend_ctx || !params) {
 		return -EINVAL;
 	}
 
-	// Allocate context
 	ior_ctx_uring *ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		return -ENOMEM;
@@ -67,248 +32,320 @@ int ior_uring_init(ior_ctx_uring **ctx_out, ior_params *params)
 	ctx->flags = params->flags;
 
 	// Prepare io_uring params
-	struct io_uring_params uring_params;
-	memset(&uring_params, 0, sizeof(uring_params));
+	struct io_uring_params uring_params = { 0 };
 
-	// Map flags
-	if (params->flags & IOR_SETUP_SQPOLL) {
-		uring_params.flags |= IORING_SETUP_SQPOLL;
-		uring_params.sq_thread_cpu = params->sq_thread_cpu;
-		uring_params.sq_thread_idle = params->sq_thread_idle;
-	}
-	if (params->flags & IOR_SETUP_IOPOLL) {
-		uring_params.flags |= IORING_SETUP_IOPOLL;
-	}
-
-	// Set CQ size if specified
 	if (params->cq_entries > 0) {
 		uring_params.flags |= IORING_SETUP_CQSIZE;
 		uring_params.cq_entries = params->cq_entries;
 	}
 
-	// Initialize io_uring
+	// Initialize io_uring - if kernel doesn't support it, this fails
 	int ret = io_uring_queue_init_params(params->sq_entries, &ctx->ring, &uring_params);
 	if (ret < 0) {
 		free(ctx);
 		return ret;
 	}
 
-	// Allocate pending SQE buffer (same size as submission queue)
-	ctx->pending_capacity = params->sq_entries;
-	ctx->pending_sqes = calloc(ctx->pending_capacity, sizeof(ior_sqe));
-	if (!ctx->pending_sqes) {
-		io_uring_queue_exit(&ctx->ring);
-		free(ctx);
-		return -ENOMEM;
-	}
-	ctx->pending_count = 0;
-
-	// Extract features
-	ctx->features = IOR_FEAT_NATIVE_ASYNC;
-	// Extract features
+	// Set features
 	ctx->features = IOR_FEAT_NATIVE_ASYNC;
 
+#ifdef IORING_FEAT_FAST_POLL
 	if (uring_params.features & IORING_FEAT_FAST_POLL) {
 		ctx->features |= IOR_FEAT_POLL_ADD;
 	}
-	if (uring_params.features & IORING_FEAT_SQPOLL_NONFIXED) {
-		ctx->features |= IOR_FEAT_SQPOLL;
-	}
+#endif
 
 #ifdef IOR_HAVE_SPLICE
-	// Check if splice is supported (Linux-specific)
 	ctx->features |= IOR_FEAT_SPLICE;
 #endif
 
 	params->features = ctx->features;
-
-	*ctx_out = ctx;
+	*backend_ctx = ctx;
 	return 0;
 }
 
-void ior_uring_destroy(ior_ctx_uring *ctx)
+static void ior_uring_backend_destroy(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return;
 	}
 
+	ior_ctx_uring *ctx = backend_ctx;
 	io_uring_queue_exit(&ctx->ring);
-	free(ctx->pending_sqes);
 	free(ctx);
 }
 
-ior_sqe *ior_uring_get_sqe(ior_ctx_uring *ctx)
+static ior_sqe *ior_uring_backend_get_sqe(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return NULL;
 	}
 
-	// Check if we have space in pending buffer
-	if (ctx->pending_count >= ctx->pending_capacity) {
-		return NULL;
+	ior_ctx_uring *ctx = backend_ctx;
+	struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+	if (sqe) {
+		memset(sqe, 0, sizeof(*sqe));
 	}
-
-	// Return pointer to next pending SQE (in ior format)
-	ior_sqe *sqe = &ctx->pending_sqes[ctx->pending_count];
-	memset(sqe, 0, sizeof(*sqe));
-	ctx->pending_count++;
-
-	return sqe;
+	return (ior_sqe *) sqe;
 }
 
-int ior_uring_submit(ior_ctx_uring *ctx)
+static int ior_uring_backend_submit(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return -EINVAL;
 	}
 
-	if (ctx->pending_count == 0) {
-		return 0;
-	}
-
-	// Convert all pending ior_sqe entries to io_uring_sqe
-	for (uint32_t i = 0; i < ctx->pending_count; i++) {
-		struct io_uring_sqe *uring_sqe = io_uring_get_sqe(&ctx->ring);
-		if (!uring_sqe) {
-			// Ring full - should not happen if sizes match
-			return -ENOSPC;
-		}
-
-		// Convert ior_sqe to io_uring_sqe
-		ior_to_uring_sqe(uring_sqe, &ctx->pending_sqes[i]);
-	}
-
-	// Submit to kernel
+	ior_ctx_uring *ctx = backend_ctx;
 	int ret = io_uring_submit(&ctx->ring);
-
-	// Clear pending buffer
-	ctx->pending_count = 0;
-
 	return ret < 0 ? -errno : ret;
 }
 
-int ior_uring_submit_and_wait(ior_ctx_uring *ctx, unsigned wait_nr)
+static int ior_uring_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return -EINVAL;
 	}
 
-	// First convert and prepare submissions
-	if (ctx->pending_count > 0) {
-		for (uint32_t i = 0; i < ctx->pending_count; i++) {
-			struct io_uring_sqe *uring_sqe = io_uring_get_sqe(&ctx->ring);
-			if (!uring_sqe) {
-				return -ENOSPC;
-			}
-			ior_to_uring_sqe(uring_sqe, &ctx->pending_sqes[i]);
-		}
-		ctx->pending_count = 0;
-	}
-
-	// Submit and wait
+	ior_ctx_uring *ctx = backend_ctx;
 	int ret = io_uring_submit_and_wait(&ctx->ring, wait_nr);
 	return ret < 0 ? -errno : ret;
 }
 
-int ior_uring_peek_cqe(ior_ctx_uring *ctx, ior_cqe **cqe_out)
+static int ior_uring_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
 {
-	if (!ctx || !cqe_out) {
+	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
 	}
 
-	struct io_uring_cqe *uring_cqe;
-	int ret = io_uring_peek_cqe(&ctx->ring, &uring_cqe);
+	ior_ctx_uring *ctx = backend_ctx;
+	struct io_uring_cqe *cqe;
+	int ret = io_uring_peek_cqe(&ctx->ring, &cqe);
 
 	if (ret < 0) {
 		return ret;
 	}
 
-	// CQE layout is compatible, just cast
-	*cqe_out = (ior_cqe *) uring_cqe;
+	*cqe_out = (ior_cqe *) cqe;
 	return 0;
 }
 
-int ior_uring_wait_cqe(ior_ctx_uring *ctx, ior_cqe **cqe_out)
+static int ior_uring_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 {
-	if (!ctx || !cqe_out) {
+	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
 	}
 
-	struct io_uring_cqe *uring_cqe;
-	int ret = io_uring_wait_cqe(&ctx->ring, &uring_cqe);
+	ior_ctx_uring *ctx = backend_ctx;
+	struct io_uring_cqe *cqe;
+	int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
 
 	if (ret < 0) {
 		return ret;
 	}
 
-	*cqe_out = (ior_cqe *) uring_cqe;
+	*cqe_out = (ior_cqe *) cqe;
 	return 0;
 }
 
-int ior_uring_wait_cqe_timeout(ior_ctx_uring *ctx, ior_cqe **cqe_out, struct timespec *timeout)
+static int ior_uring_backend_wait_cqe_timeout(
+		void *backend_ctx, ior_cqe **cqe_out, struct timespec *timeout)
 {
-	if (!ctx || !cqe_out) {
+	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
 	}
 
-	struct io_uring_cqe *uring_cqe;
+	ior_ctx_uring *ctx = backend_ctx;
+	struct io_uring_cqe *cqe;
+
+#ifdef __kernel_timespec
 	struct __kernel_timespec ts;
-
 	if (timeout) {
 		ts.tv_sec = timeout->tv_sec;
 		ts.tv_nsec = timeout->tv_nsec;
 	}
-
-	int ret = io_uring_wait_cqe_timeout(&ctx->ring, &uring_cqe, timeout ? &ts : NULL);
+	int ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, timeout ? &ts : NULL);
+#else
+	// Fallback for older liburing without timeout support
+	int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
+#endif
 
 	if (ret < 0) {
 		return ret;
 	}
 
-	*cqe_out = (ior_cqe *) uring_cqe;
+	*cqe_out = (ior_cqe *) cqe;
 	return 0;
 }
 
-void ior_uring_cqe_seen(ior_ctx_uring *ctx, ior_cqe *cqe)
+static void ior_uring_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 {
-	if (!ctx || !cqe) {
+	if (!backend_ctx || !cqe) {
 		return;
 	}
 
+	ior_ctx_uring *ctx = backend_ctx;
 	io_uring_cqe_seen(&ctx->ring, (struct io_uring_cqe *) cqe);
 }
 
-unsigned ior_uring_peek_batch_cqe(ior_ctx_uring *ctx, ior_cqe **cqes, unsigned max)
+static unsigned ior_uring_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqes, unsigned max)
 {
-	if (!ctx || !cqes || max == 0) {
+	if (!backend_ctx || !cqes || max == 0) {
 		return 0;
 	}
 
+	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe **uring_cqes = (struct io_uring_cqe **) cqes;
 	return io_uring_peek_batch_cqe(&ctx->ring, uring_cqes, max);
 }
 
-void ior_uring_cq_advance(ior_ctx_uring *ctx, unsigned nr)
+static void ior_uring_backend_cq_advance(void *backend_ctx, unsigned nr)
 {
-	if (!ctx || nr == 0) {
+	if (!backend_ctx || nr == 0) {
 		return;
 	}
 
+	ior_ctx_uring *ctx = backend_ctx;
 	io_uring_cq_advance(&ctx->ring, nr);
 }
 
-const char *ior_uring_backend_name(void)
+/* SQE preparation helpers - use liburing's helpers directly */
+
+static void ior_uring_backend_prep_nop(ior_sqe *sqe)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_nop(s);
+}
+
+static void ior_uring_backend_prep_read(
+		ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_read(s, fd, buf, nbytes, offset);
+}
+
+static void ior_uring_backend_prep_write(
+		ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_write(s, fd, buf, nbytes, offset);
+}
+
+static void ior_uring_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
+		uint64_t off_out, unsigned nbytes, unsigned flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+#ifdef IORING_OP_SPLICE
+	io_uring_prep_splice(s, fd_in, off_in, fd_out, off_out, nbytes, flags);
+#else
+	(void) fd_in;
+	(void) off_in;
+	(void) fd_out;
+	(void) off_out;
+	(void) nbytes;
+	(void) flags;
+	memset(s, 0, sizeof(*s));
+	s->opcode = 0xFF; // Invalid opcode
+#endif
+}
+
+static void ior_uring_backend_prep_timeout(
+		ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+
+#ifdef __kernel_timespec
+	struct __kernel_timespec kts;
+	if (ts) {
+		kts.tv_sec = ts->tv_sec;
+		kts.tv_nsec = ts->tv_nsec;
+	}
+	io_uring_prep_timeout(s, ts ? &kts : NULL, count, flags);
+#else
+	// Older liburing might not have this
+	memset(s, 0, sizeof(*s));
+	s->opcode = IORING_OP_TIMEOUT;
+	s->fd = -1;
+	s->addr = (uint64_t) (uintptr_t) ts;
+	s->len = 1;
+	s->off = count;
+	s->timeout_flags = flags;
+#endif
+}
+
+static void ior_uring_backend_sqe_set_data(ior_sqe *sqe, void *data)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_sqe_set_data(s, data);
+}
+
+static void ior_uring_backend_sqe_set_flags(ior_sqe *sqe, uint8_t flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	s->flags = flags;
+}
+
+/* CQE accessors */
+
+static void *ior_uring_backend_cqe_get_data(ior_cqe *cqe)
+{
+	ior_cqe_uring *c = &cqe->uring;
+	return io_uring_cqe_get_data(c);
+}
+
+static int32_t ior_uring_backend_cqe_get_res(ior_cqe *cqe)
+{
+	ior_cqe_uring *c = &cqe->uring;
+	return c->res;
+}
+
+static uint32_t ior_uring_backend_cqe_get_flags(ior_cqe *cqe)
+{
+	ior_cqe_uring *c = &cqe->uring;
+	return c->flags;
+}
+
+/* Backend info */
+
+static const char *ior_uring_backend_name(void)
 {
 	return "io_uring";
 }
 
-uint32_t ior_uring_get_features(ior_ctx_uring *ctx)
+static uint32_t ior_uring_backend_get_features(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return 0;
 	}
 
+	ior_ctx_uring *ctx = backend_ctx;
 	return ctx->features;
 }
+
+/* Export vtable */
+const ior_backend_ops ior_uring_ops = {
+	.init = ior_uring_backend_init,
+	.destroy = ior_uring_backend_destroy,
+	.get_sqe = ior_uring_backend_get_sqe,
+	.submit = ior_uring_backend_submit,
+	.submit_and_wait = ior_uring_backend_submit_and_wait,
+	.peek_cqe = ior_uring_backend_peek_cqe,
+	.wait_cqe = ior_uring_backend_wait_cqe,
+	.wait_cqe_timeout = ior_uring_backend_wait_cqe_timeout,
+	.cqe_seen = ior_uring_backend_cqe_seen,
+	.peek_batch_cqe = ior_uring_backend_peek_batch_cqe,
+	.cq_advance = ior_uring_backend_cq_advance,
+	.prep_nop = ior_uring_backend_prep_nop,
+	.prep_read = ior_uring_backend_prep_read,
+	.prep_write = ior_uring_backend_prep_write,
+	.prep_splice = ior_uring_backend_prep_splice,
+	.prep_timeout = ior_uring_backend_prep_timeout,
+	.sqe_set_data = ior_uring_backend_sqe_set_data,
+	.sqe_set_flags = ior_uring_backend_sqe_set_flags,
+	.cqe_get_data = ior_uring_backend_cqe_get_data,
+	.cqe_get_res = ior_uring_backend_cqe_get_res,
+	.cqe_get_flags = ior_uring_backend_cqe_get_flags,
+	.backend_name = ior_uring_backend_name,
+	.get_features = ior_uring_backend_get_features,
+};
 
 #endif /* IOR_HAVE_URING */

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
+#include "../src/ior_backend.h"
 #include "../src/ior_threads_ring.h"
 
 // Test ring initialization
@@ -28,11 +29,11 @@ static void test_ring_operations(void **state)
 
 	// Post some CQEs
 	for (int i = 0; i < 5; i++) {
-		ior_cqe cqe = {
-			.user_data = i,
-			.res = i * 10,
-			.flags = 0,
-		};
+		ior_cqe cqe = { .threads = {
+								.user_data = i,
+								.res = i * 10,
+								.flags = 0,
+						} };
 
 		int ret = ior_threads_ring_post_cqe(&ring, &cqe);
 		assert_return_code(ret, 0);
@@ -44,8 +45,8 @@ static void test_ring_operations(void **state)
 	for (int i = 0; i < 5; i++) {
 		ior_cqe *cqe = ior_threads_ring_peek_cqe(&ring);
 		assert_non_null(cqe);
-		assert_int_equal(cqe->user_data, i);
-		assert_int_equal(cqe->res, i * 10);
+		assert_int_equal(cqe->threads.user_data, i);
+		assert_int_equal(cqe->threads.res, i * 10);
 
 		ior_threads_ring_cqe_seen(&ring);
 	}

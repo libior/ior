@@ -10,6 +10,7 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 #include <cmocka.h>
 #include "../src/ior.h"

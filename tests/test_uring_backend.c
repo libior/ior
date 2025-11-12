@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
-#include "../src/ior_uring.h"
 
 #ifdef IOR_HAVE_URING
 
@@ -50,8 +49,8 @@ static void test_uring_read(void **state)
 	ior_sqe *sqe = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe);
 
-	ior_prep_read(sqe, ts->test_fd, buffer, sizeof(buffer), 0);
-	ior_sqe_set_data(sqe, (void *) 0x1234);
+	ior_prep_read(ts->ctx, sqe, ts->test_fd, buffer, sizeof(buffer), 0);
+	ior_sqe_set_data(ts->ctx, sqe, (void *) 0x1234);
 
 	// Submit and wait
 	int ret = ior_submit_and_wait(ts->ctx, 1);
@@ -63,10 +62,11 @@ static void test_uring_read(void **state)
 	assert_return_code(ret, 0);
 
 	// Check result
-	assert_true(cqe->res > 0);
-	assert_ptr_equal(ior_cqe_get_data(cqe), (void *) 0x1234);
+	int32_t res = ior_cqe_get_res(ts->ctx, cqe);
+	assert_true(res > 0);
+	assert_ptr_equal(ior_cqe_get_data(ts->ctx, cqe), (void *) 0x1234);
 
-	printf("io_uring read %d bytes: %s\n", cqe->res, buffer);
+	printf("io_uring read %d bytes: %s\n", res, buffer);
 
 	ior_cqe_seen(ts->ctx, cqe);
 }
@@ -90,8 +90,8 @@ static void test_uring_write(void **state)
 	ior_sqe *sqe = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe);
 
-	ior_prep_write(sqe, ts->test_fd, data, len, 0);
-	ior_sqe_set_data(sqe, NULL);
+	ior_prep_write(ts->ctx, sqe, ts->test_fd, data, len, 0);
+	ior_sqe_set_data(ts->ctx, sqe, NULL);
 
 	// Submit and wait
 	int ret = ior_submit_and_wait(ts->ctx, 1);
@@ -103,9 +103,10 @@ static void test_uring_write(void **state)
 	assert_return_code(ret, 0);
 
 	// Check result
-	assert_int_equal(cqe->res, (int) len);
+	int32_t res = ior_cqe_get_res(ts->ctx, cqe);
+	assert_int_equal(res, (int) len);
 
-	printf("io_uring wrote %d bytes\n", cqe->res);
+	printf("io_uring wrote %d bytes\n", res);
 
 	ior_cqe_seen(ts->ctx, cqe);
 
@@ -136,18 +137,18 @@ static void test_uring_batch(void **state)
 	// Queue multiple reads
 	ior_sqe *sqe1 = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe1);
-	ior_prep_read(sqe1, ts->test_fd, buffer1, sizeof(buffer1), 0);
-	ior_sqe_set_data(sqe1, (void *) 0x1);
+	ior_prep_read(ts->ctx, sqe1, ts->test_fd, buffer1, sizeof(buffer1), 0);
+	ior_sqe_set_data(ts->ctx, sqe1, (void *) 0x1);
 
 	ior_sqe *sqe2 = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe2);
-	ior_prep_read(sqe2, ts->test_fd, buffer2, sizeof(buffer2), 0);
-	ior_sqe_set_data(sqe2, (void *) 0x2);
+	ior_prep_read(ts->ctx, sqe2, ts->test_fd, buffer2, sizeof(buffer2), 0);
+	ior_sqe_set_data(ts->ctx, sqe2, (void *) 0x2);
 
 	ior_sqe *sqe3 = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe3);
-	ior_prep_read(sqe3, ts->test_fd, buffer3, sizeof(buffer3), 0);
-	ior_sqe_set_data(sqe3, (void *) 0x3);
+	ior_prep_read(ts->ctx, sqe3, ts->test_fd, buffer3, sizeof(buffer3), 0);
+	ior_sqe_set_data(ts->ctx, sqe3, (void *) 0x3);
 
 	// Submit all
 	int ret = ior_submit_and_wait(ts->ctx, 3);
@@ -163,10 +164,11 @@ static void test_uring_batch(void **state)
 	// Verify completions
 	for (unsigned i = 0; i < count; i++) {
 		assert_non_null(cqes[i]);
-		assert_true(cqes[i]->res > 0);
+		int32_t res = ior_cqe_get_res(ts->ctx, cqes[i]);
+		assert_true(res > 0);
 
-		void *data = ior_cqe_get_data(cqes[i]);
-		printf("CQE %u: res=%d, data=%p\n", i, cqes[i]->res, data);
+		void *data = ior_cqe_get_data(ts->ctx, cqes[i]);
+		printf("CQE %u: res=%d, data=%p\n", i, res, data);
 	}
 
 	// Advance by batch count

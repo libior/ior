@@ -5,10 +5,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-#include "ior_threads_pool.h"
+#include "ior_backend.h"
 #include "ior_threads.h"
-#include "ior_threads_ring.h"
-#include "ior_threads_event.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -272,41 +270,43 @@ static void *worker_thread_func(void *arg)
 
 static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
 {
-	ior_cqe cqe = {
-		.user_data = sqe->user_data,
-		.res = 0,
-		.flags = 0,
-	};
+	ior_cqe cqe = { .threads = {
+							.user_data = sqe->threads.user_data,
+							.res = 0,
+							.flags = 0,
+					} };
 
 	// Process based on operation type
-	switch (sqe->opcode) {
+	switch (sqe->threads.opcode) {
 		case IOR_OP_NOP:
 			// No-op: just complete successfully
-			cqe.res = 0;
+			cqe.threads.res = 0;
 			break;
 
 		case IOR_OP_READ: {
 			// Perform blocking read
-			ssize_t ret = pread(sqe->fd, (void *) (uintptr_t) sqe->addr, sqe->len, sqe->off);
-			cqe.res = (ret < 0) ? -errno : ret;
+			ssize_t ret = pread(sqe->threads.fd, (void *) (uintptr_t) sqe->threads.addr,
+					sqe->threads.len, sqe->threads.off);
+			cqe.threads.res = (ret < 0) ? -errno : ret;
 			break;
 		}
 
 		case IOR_OP_WRITE: {
 			// Perform blocking write
-			ssize_t ret = pwrite(sqe->fd, (const void *) (uintptr_t) sqe->addr, sqe->len, sqe->off);
-			cqe.res = (ret < 0) ? -errno : ret;
+			ssize_t ret = pwrite(sqe->threads.fd, (const void *) (uintptr_t) sqe->threads.addr,
+					sqe->threads.len, sqe->threads.off);
+			cqe.threads.res = (ret < 0) ? -errno : ret;
 			break;
 		}
 
 		case IOR_OP_TIMER: {
 			// Sleep for specified time
-			struct timespec *ts = (struct timespec *) (uintptr_t) sqe->addr;
+			struct timespec *ts = (struct timespec *) (uintptr_t) sqe->threads.addr;
 			if (ts) {
 				nanosleep(ts, NULL);
-				cqe.res = 0;
+				cqe.threads.res = 0;
 			} else {
-				cqe.res = -EINVAL;
+				cqe.threads.res = -EINVAL;
 			}
 			break;
 		}
@@ -314,13 +314,15 @@ static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
 		case IOR_OP_SPLICE: {
 			// Splice between two file descriptors
 #ifdef IOR_HAVE_SPLICE
-			ssize_t ret = splice(sqe->splice_fd_in, (loff_t *) (sqe->addr ? &sqe->addr : NULL),
-					sqe->fd, (loff_t *) (sqe->off ? &sqe->off : NULL), sqe->len, sqe->splice_flags);
-			cqe.res = (ret < 0) ? -errno : ret;
+			ssize_t ret = splice(sqe->threads.splice_fd_in,
+					(loff_t *) (sqe->threads.addr ? &sqe->threads.addr : NULL), sqe->threads.fd,
+					(loff_t *) (sqe->threads.off ? &sqe->threads.off : NULL), sqe->threads.len,
+					sqe->threads.splice_flags);
+			cqe.threads.res = (ret < 0) ? -errno : ret;
 #else
 			// splice not available on non-Linux
 			// TODO: emulate it
-			cqe.res = -ENOSYS;
+			cqe.threads.res = -ENOSYS;
 #endif
 			break;
 		}
@@ -330,11 +332,11 @@ static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
 		case IOR_OP_CONNECT:
 		case IOR_OP_LISTEN:
 		case IOR_OP_BIND:
-			cqe.res = -ENOSYS; // Not yet implemented
+			cqe.threads.res = -ENOSYS; // Not yet implemented
 			break;
 
 		default:
-			cqe.res = -EINVAL; // Unknown operation
+			cqe.threads.res = -EINVAL; // Unknown operation
 			break;
 	}
 

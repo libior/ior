@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+#include "config.h"
+#include "ior_backend.h"
 #include "ior_threads.h"
 #include <stdlib.h>
 #include <string.h>
@@ -7,14 +9,8 @@
 #include <time.h>
 #include <poll.h>
 
-// Default CQ size multiplier if not specified
-#define IOR_THREADS_CQ_MULTIPLIER 2
-
-// Default minimum number of entries
-#define IOR_THREADS_MIN_ENTRIES 32
-
-// Ensure size is power of 2
-static uint32_t round_up_pow2(uint32_t n)
+/* Ensure size is power of 2 */
+static uint32_t ior_threads_round_up_pow2(uint32_t n)
 {
 	if (n == 0) {
 		return 1;
@@ -31,9 +27,11 @@ static uint32_t round_up_pow2(uint32_t n)
 	return n;
 }
 
-int ior_threads_init(ior_ctx_threads **ctx_out, ior_params *params)
+/* Backend operations */
+
+static int ior_threads_backend_init(void **backend_ctx, ior_params *params)
 {
-	if (!ctx_out || !params) {
+	if (!backend_ctx || !params) {
 		return -EINVAL;
 	}
 
@@ -50,7 +48,7 @@ int ior_threads_init(ior_ctx_threads **ctx_out, ior_params *params)
 	if (sq_entries < IOR_THREADS_MIN_ENTRIES) {
 		sq_entries = IOR_THREADS_MIN_ENTRIES;
 	}
-	sq_entries = round_up_pow2(sq_entries);
+	sq_entries = ior_threads_round_up_pow2(sq_entries);
 
 	uint32_t cq_entries = params->cq_entries;
 	if (cq_entries == 0) {
@@ -59,7 +57,7 @@ int ior_threads_init(ior_ctx_threads **ctx_out, ior_params *params)
 	if (cq_entries < IOR_THREADS_MIN_ENTRIES) {
 		cq_entries = IOR_THREADS_MIN_ENTRIES;
 	}
-	cq_entries = round_up_pow2(cq_entries);
+	cq_entries = ior_threads_round_up_pow2(cq_entries);
 
 	// Initialize submission queue ring
 	int ret = ior_threads_ring_init(&ctx->sq_ring, sq_entries, 1);
@@ -85,10 +83,8 @@ int ior_threads_init(ior_ctx_threads **ctx_out, ior_params *params)
 		return ret;
 	}
 
-	// Create thread pool
-	// Use 0 for auto-detect based on CPU count
-	uint32_t num_threads = 0; // TODO: Could be configurable via params
-	ctx->pool = ior_threads_pool_create(ctx, num_threads);
+	// Create thread pool (0 = auto-detect based on CPU count)
+	ctx->pool = ior_threads_pool_create(ctx, 0);
 	if (!ctx->pool) {
 		ior_threads_event_destroy(&ctx->event);
 		ior_threads_ring_destroy(&ctx->cq_ring);
@@ -99,17 +95,23 @@ int ior_threads_init(ior_ctx_threads **ctx_out, ior_params *params)
 
 	// Set supported features
 	ctx->features = 0; // No special features for basic thread backend
+#ifdef IOR_HAVE_SPLICE
+	ctx->features |= IOR_FEAT_SPLICE;
+#endif
+
 	params->features = ctx->features;
 
-	*ctx_out = ctx;
+	*backend_ctx = ctx;
 	return 0;
 }
 
-void ior_threads_destroy(ior_ctx_threads *ctx)
+static void ior_threads_backend_destroy(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return;
 	}
+
+	ior_ctx_threads *ctx = backend_ctx;
 
 	// Destroy thread pool first (waits for threads to finish)
 	ior_threads_pool_destroy(ctx->pool);
@@ -125,20 +127,23 @@ void ior_threads_destroy(ior_ctx_threads *ctx)
 	free(ctx);
 }
 
-ior_sqe *ior_threads_get_sqe(ior_ctx_threads *ctx)
+static ior_sqe *ior_threads_backend_get_sqe(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return NULL;
 	}
 
+	ior_ctx_threads *ctx = backend_ctx;
 	return ior_threads_ring_get_sqe(&ctx->sq_ring);
 }
 
-int ior_threads_submit(ior_ctx_threads *ctx)
+static int ior_threads_backend_submit(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return -EINVAL;
 	}
+
+	ior_ctx_threads *ctx = backend_ctx;
 
 	// Get number of pending submissions
 	uint32_t count = ior_threads_ring_count(&ctx->sq_ring);
@@ -152,14 +157,16 @@ int ior_threads_submit(ior_ctx_threads *ctx)
 	return (int) count;
 }
 
-int ior_threads_submit_and_wait(ior_ctx_threads *ctx, unsigned wait_nr)
+static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return -EINVAL;
 	}
 
+	ior_ctx_threads *ctx = backend_ctx;
+
 	// Submit pending operations
-	int submitted = ior_threads_submit(ctx);
+	int submitted = ior_threads_backend_submit(backend_ctx);
 	if (submitted < 0) {
 		return submitted;
 	}
@@ -181,11 +188,13 @@ int ior_threads_submit_and_wait(ior_ctx_threads *ctx, unsigned wait_nr)
 	return submitted;
 }
 
-int ior_threads_peek_cqe(ior_ctx_threads *ctx, ior_cqe **cqe_out)
+static int ior_threads_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
 {
-	if (!ctx || !cqe_out) {
+	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
 	}
+
+	ior_ctx_threads *ctx = backend_ctx;
 
 	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
 	if (!cqe) {
@@ -196,11 +205,13 @@ int ior_threads_peek_cqe(ior_ctx_threads *ctx, ior_cqe **cqe_out)
 	return 0;
 }
 
-int ior_threads_wait_cqe(ior_ctx_threads *ctx, ior_cqe **cqe_out)
+static int ior_threads_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 {
-	if (!ctx || !cqe_out) {
+	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
 	}
+
+	ior_ctx_threads *ctx = backend_ctx;
 
 	// Fast path: check if CQE already available
 	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
@@ -228,11 +239,14 @@ int ior_threads_wait_cqe(ior_ctx_threads *ctx, ior_cqe **cqe_out)
 	return 0;
 }
 
-int ior_threads_wait_cqe_timeout(ior_ctx_threads *ctx, ior_cqe **cqe_out, struct timespec *timeout)
+static int ior_threads_backend_wait_cqe_timeout(
+		void *backend_ctx, ior_cqe **cqe_out, struct timespec *timeout)
 {
-	if (!ctx || !cqe_out) {
+	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
 	}
+
+	ior_ctx_threads *ctx = backend_ctx;
 
 	// Fast path: check if CQE already available
 	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
@@ -277,43 +291,159 @@ int ior_threads_wait_cqe_timeout(ior_ctx_threads *ctx, ior_cqe **cqe_out, struct
 	return 0;
 }
 
-void ior_threads_cqe_seen(ior_ctx_threads *ctx, ior_cqe *cqe)
+static void ior_threads_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return;
 	}
 
+	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_ring_cqe_seen(&ctx->cq_ring);
 }
 
-unsigned ior_threads_peek_batch_cqe(ior_ctx_threads *ctx, ior_cqe **cqes, unsigned max)
+static unsigned ior_threads_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqes, unsigned max)
 {
-	if (!ctx || !cqes || max == 0) {
+	if (!backend_ctx || !cqes || max == 0) {
 		return 0;
 	}
 
+	ior_ctx_threads *ctx = backend_ctx;
 	return ior_threads_ring_peek_batch_cqe(&ctx->cq_ring, cqes, max);
 }
 
-void ior_threads_cq_advance(ior_ctx_threads *ctx, unsigned nr)
+static void ior_threads_backend_cq_advance(void *backend_ctx, unsigned nr)
 {
-	if (!ctx || nr == 0) {
+	if (!backend_ctx || nr == 0) {
 		return;
 	}
 
+	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_ring_advance(&ctx->cq_ring, nr);
 }
 
-const char *ior_threads_backend_name(void)
+/* SQE preparation helpers */
+
+static void ior_threads_backend_prep_nop(ior_sqe *sqe)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_NOP;
+	sqe->threads.fd = -1;
+}
+
+static void ior_threads_backend_prep_read(
+		ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_READ;
+	sqe->threads.fd = fd;
+	sqe->threads.addr = (uint64_t) (uintptr_t) buf;
+	sqe->threads.len = nbytes;
+	sqe->threads.off = offset;
+}
+
+static void ior_threads_backend_prep_write(
+		ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_WRITE;
+	sqe->threads.fd = fd;
+	sqe->threads.addr = (uint64_t) (uintptr_t) buf;
+	sqe->threads.len = nbytes;
+	sqe->threads.off = offset;
+}
+
+static void ior_threads_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
+		uint64_t off_out, unsigned nbytes, unsigned flags)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_SPLICE;
+	sqe->threads.fd = fd_out;
+	sqe->threads.len = nbytes;
+	sqe->threads.off = off_out;
+	sqe->threads.splice_off_in = off_in;
+	sqe->threads.splice_fd_in = fd_in;
+	sqe->threads.splice_flags = flags;
+}
+
+static void ior_threads_backend_prep_timeout(
+		ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_TIMER;
+	sqe->threads.fd = -1;
+	sqe->threads.addr = (uint64_t) (uintptr_t) ts;
+	sqe->threads.len = 1;
+	sqe->threads.off = count;
+	sqe->threads.timeout_flags = flags;
+}
+
+static void ior_threads_backend_sqe_set_data(ior_sqe *sqe, void *data)
+{
+	sqe->threads.user_data = (uint64_t) (uintptr_t) data;
+}
+
+static void ior_threads_backend_sqe_set_flags(ior_sqe *sqe, uint8_t flags)
+{
+	sqe->threads.flags = flags;
+}
+
+/* CQE accessors */
+
+static void *ior_threads_backend_cqe_get_data(ior_cqe *cqe)
+{
+	return (void *) (uintptr_t) cqe->threads.user_data;
+}
+
+static int32_t ior_threads_backend_cqe_get_res(ior_cqe *cqe)
+{
+	return cqe->threads.res;
+}
+
+static uint32_t ior_threads_backend_cqe_get_flags(ior_cqe *cqe)
+{
+	return cqe->threads.flags;
+}
+
+/* Backend info */
+
+static const char *ior_threads_backend_name(void)
 {
 	return "threads";
 }
 
-uint32_t ior_threads_get_features(ior_ctx_threads *ctx)
+static uint32_t ior_threads_backend_get_features(void *backend_ctx)
 {
-	if (!ctx) {
+	if (!backend_ctx) {
 		return 0;
 	}
 
+	ior_ctx_threads *ctx = backend_ctx;
 	return ctx->features;
 }
+
+/* Export vtable */
+const ior_backend_ops ior_threads_ops = {
+	.init = ior_threads_backend_init,
+	.destroy = ior_threads_backend_destroy,
+	.get_sqe = ior_threads_backend_get_sqe,
+	.submit = ior_threads_backend_submit,
+	.submit_and_wait = ior_threads_backend_submit_and_wait,
+	.peek_cqe = ior_threads_backend_peek_cqe,
+	.wait_cqe = ior_threads_backend_wait_cqe,
+	.wait_cqe_timeout = ior_threads_backend_wait_cqe_timeout,
+	.cqe_seen = ior_threads_backend_cqe_seen,
+	.peek_batch_cqe = ior_threads_backend_peek_batch_cqe,
+	.cq_advance = ior_threads_backend_cq_advance,
+	.prep_nop = ior_threads_backend_prep_nop,
+	.prep_read = ior_threads_backend_prep_read,
+	.prep_write = ior_threads_backend_prep_write,
+	.prep_splice = ior_threads_backend_prep_splice,
+	.prep_timeout = ior_threads_backend_prep_timeout,
+	.sqe_set_data = ior_threads_backend_sqe_set_data,
+	.sqe_set_flags = ior_threads_backend_sqe_set_flags,
+	.cqe_get_data = ior_threads_backend_cqe_get_data,
+	.cqe_get_res = ior_threads_backend_cqe_get_res,
+	.cqe_get_flags = ior_threads_backend_cqe_get_flags,
+	.backend_name = ior_threads_backend_name,
+	.get_features = ior_threads_backend_get_features,
+};
