@@ -119,7 +119,7 @@ int ior_wait_cqe(ior_ctx *ctx, ior_cqe **cqe_out)
 	return (ctx && cqe_out) ? ctx->ops->wait_cqe(ctx->backend_ctx, cqe_out) : -EINVAL;
 }
 
-int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, struct timespec *timeout)
+int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, ior_timespec *timeout)
 {
 	return (ctx && cqe_out) ? ctx->ops->wait_cqe_timeout(ctx->backend_ctx, cqe_out, timeout)
 							: -EINVAL;
@@ -175,8 +175,7 @@ void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in, int
 	}
 }
 
-void ior_prep_timeout(
-		ior_ctx *ctx, ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags)
+void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags)
 {
 	if (ctx && sqe) {
 		ctx->ops->prep_timeout(sqe, ts, count, flags);

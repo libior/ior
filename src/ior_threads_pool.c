@@ -301,9 +301,13 @@ static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
 
 		case IOR_OP_TIMER: {
 			// Sleep for specified time
-			struct timespec *ts = (struct timespec *) (uintptr_t) sqe->threads.addr;
+			ior_timespec *ts = (ior_timespec *) (uintptr_t) sqe->threads.addr;
 			if (ts) {
-				nanosleep(ts, NULL);
+				struct timespec sts = {
+					.tv_sec = ts->tv_sec,
+					.tv_nsec = ts->tv_nsec,
+				};
+				nanosleep(&sts, NULL);
 				cqe.threads.res = 0;
 			} else {
 				cqe.threads.res = -EINVAL;

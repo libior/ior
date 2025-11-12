@@ -115,7 +115,7 @@ typedef struct ior_backend_ops {
 	/* Completion queue operations */
 	int (*peek_cqe)(void *backend_ctx, ior_cqe **cqe_out);
 	int (*wait_cqe)(void *backend_ctx, ior_cqe **cqe_out);
-	int (*wait_cqe_timeout)(void *backend_ctx, ior_cqe **cqe_out, struct timespec *timeout);
+	int (*wait_cqe_timeout)(void *backend_ctx, ior_cqe **cqe_out, ior_timespec *timeout);
 	void (*cqe_seen)(void *backend_ctx, ior_cqe *cqe);
 	unsigned (*peek_batch_cqe)(void *backend_ctx, ior_cqe **cqes, unsigned max);
 	void (*cq_advance)(void *backend_ctx, unsigned nr);
@@ -126,7 +126,7 @@ typedef struct ior_backend_ops {
 	void (*prep_write)(ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset);
 	void (*prep_splice)(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out, uint64_t off_out,
 			unsigned nbytes, unsigned flags);
-	void (*prep_timeout)(ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags);
+	void (*prep_timeout)(ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
 	void (*sqe_set_data)(ior_sqe *sqe, void *data);
 	void (*sqe_set_flags)(ior_sqe *sqe, uint8_t flags);
 

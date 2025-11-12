@@ -160,7 +160,7 @@ int ior_submit_and_wait(ior_ctx *ctx, unsigned wait_nr);
 ```c
 int ior_peek_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
 int ior_wait_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
-int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, struct timespec *timeout);
+int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, ior_timespec *timeout);
 void ior_cqe_seen(ior_ctx *ctx, ior_cqe *cqe);
 ```
 
@@ -168,7 +168,7 @@ void ior_cqe_seen(ior_ctx *ctx, ior_cqe *cqe);
 ```c
 void ior_prep_read(ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset);
 void ior_prep_write(ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset);
-void ior_prep_timeout(ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags);
+void ior_prep_timeout(ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
 void ior_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out, uint64_t off_out, unsigned nbytes, unsigned splice_flags);
 void ior_sqe_set_data(ior_sqe *sqe, void *data);
 void *ior_cqe_get_data(ior_cqe *cqe);

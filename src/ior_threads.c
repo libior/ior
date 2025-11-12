@@ -240,7 +240,7 @@ static int ior_threads_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 }
 
 static int ior_threads_backend_wait_cqe_timeout(
-		void *backend_ctx, ior_cqe **cqe_out, struct timespec *timeout)
+		void *backend_ctx, ior_cqe **cqe_out, ior_timespec *timeout)
 {
 	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
@@ -366,7 +366,7 @@ static void ior_threads_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t of
 }
 
 static void ior_threads_backend_prep_timeout(
-		ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags)
+		ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags)
 {
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->threads.opcode = IOR_OP_TIMER;

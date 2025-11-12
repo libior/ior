@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-3-Clause */ /* SPDX-License-Identifier: BSD-3-Clause */
+/* SPDX-License-Identifier: BSD-3-Clause */
 #include "config.h"
 
 #ifdef IOR_HAVE_IOCP
@@ -8,35 +8,6 @@
 #include <string.h>
 #include <errno.h>
 #include <windows.h>
-
-/* For IOCP backend, we'll have our own SQE/CQE structures (similar to threads) */
-typedef struct ior_sqe ior_sqe;
-typedef struct ior_cqe ior_cqe;
-
-/* SQE structure - our own format */
-struct ior_sqe {
-	uint8_t opcode;
-	uint8_t flags;
-	uint16_t ioprio;
-	int32_t fd;
-	uint64_t off;
-	uint64_t addr;
-	uint32_t len;
-	union {
-		uint32_t rw_flags;
-		uint32_t timeout_flags;
-	};
-	uint64_t user_data;
-	uint32_t file_index;
-	uint64_t __pad[3];
-};
-
-/* CQE structure - our own format */
-struct ior_cqe {
-	uint64_t user_data;
-	int32_t res;
-	uint32_t flags;
-};
 
 /* IOCP backend context */
 typedef struct ior_ctx_iocp {
@@ -124,7 +95,7 @@ static int ior_iocp_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 }
 
 static int ior_iocp_backend_wait_cqe_timeout(
-		void *backend_ctx, ior_cqe **cqe_out, struct timespec *timeout)
+		void *backend_ctx, ior_cqe **cqe_out, ior_timespec *timeout)
 {
 	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
@@ -167,30 +138,30 @@ static void ior_iocp_backend_cq_advance(void *backend_ctx, unsigned nr)
 static void ior_iocp_backend_prep_nop(ior_sqe *sqe)
 {
 	memset(sqe, 0, sizeof(*sqe));
-	sqe->opcode = IOR_OP_NOP;
-	sqe->fd = -1;
+	sqe->iocp.opcode = IOR_OP_NOP;
+	sqe->iocp.fd = -1;
 }
 
 static void ior_iocp_backend_prep_read(
 		ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset)
 {
 	memset(sqe, 0, sizeof(*sqe));
-	sqe->opcode = IOR_OP_READ;
-	sqe->fd = fd;
-	sqe->addr = (uint64_t) (uintptr_t) buf;
-	sqe->len = nbytes;
-	sqe->off = offset;
+	sqe->iocp.opcode = IOR_OP_READ;
+	sqe->iocp.fd = fd;
+	sqe->iocp.addr = (uint64_t) (uintptr_t) buf;
+	sqe->iocp.len = nbytes;
+	sqe->iocp.off = offset;
 }
 
 static void ior_iocp_backend_prep_write(
 		ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset)
 {
 	memset(sqe, 0, sizeof(*sqe));
-	sqe->opcode = IOR_OP_WRITE;
-	sqe->fd = fd;
-	sqe->addr = (uint64_t) (uintptr_t) buf;
-	sqe->len = nbytes;
-	sqe->off = offset;
+	sqe->iocp.opcode = IOR_OP_WRITE;
+	sqe->iocp.fd = fd;
+	sqe->iocp.addr = (uint64_t) (uintptr_t) buf;
+	sqe->iocp.len = nbytes;
+	sqe->iocp.off = offset;
 }
 
 static void ior_iocp_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
@@ -198,30 +169,30 @@ static void ior_iocp_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_i
 {
 	// Splice not supported on Windows
 	memset(sqe, 0, sizeof(*sqe));
-	sqe->opcode = IOR_OP_SPLICE;
-	sqe->fd = -1;
+	sqe->iocp.opcode = IOR_OP_SPLICE;
+	sqe->iocp.fd = -1;
 }
 
 static void ior_iocp_backend_prep_timeout(
-		ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags)
+		ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags)
 {
 	memset(sqe, 0, sizeof(*sqe));
-	sqe->opcode = IOR_OP_TIMER;
-	sqe->fd = -1;
-	sqe->addr = (uint64_t) (uintptr_t) ts;
-	sqe->len = 1;
-	sqe->off = count;
-	sqe->timeout_flags = flags;
+	sqe->iocp.opcode = IOR_OP_TIMER;
+	sqe->iocp.fd = -1;
+	sqe->iocp.addr = (uint64_t) (uintptr_t) ts;
+	sqe->iocp.len = 1;
+	sqe->iocp.off = count;
+	sqe->iocp.timeout_flags = flags;
 }
 
 static void ior_iocp_backend_sqe_set_data(ior_sqe *sqe, void *data)
 {
-	sqe->user_data = (uint64_t) (uintptr_t) data;
+	sqe->iocp.user_data = (uint64_t) (uintptr_t) data;
 }
 
 static void ior_iocp_backend_sqe_set_flags(ior_sqe *sqe, uint8_t flags)
 {
-	sqe->flags = flags;
+	sqe->iocp.flags = flags;
 }
 
 /* CQE accessors */

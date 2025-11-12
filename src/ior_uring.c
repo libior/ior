@@ -148,7 +148,7 @@ static int ior_uring_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 }
 
 static int ior_uring_backend_wait_cqe_timeout(
-		void *backend_ctx, ior_cqe **cqe_out, struct timespec *timeout)
+		void *backend_ctx, ior_cqe **cqe_out, ior_timespec *timeout)
 {
 	if (!backend_ctx || !cqe_out) {
 		return -EINVAL;
@@ -157,17 +157,7 @@ static int ior_uring_backend_wait_cqe_timeout(
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe *cqe;
 
-#ifdef __kernel_timespec
-	struct __kernel_timespec ts;
-	if (timeout) {
-		ts.tv_sec = timeout->tv_sec;
-		ts.tv_nsec = timeout->tv_nsec;
-	}
-	int ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, timeout ? &ts : NULL);
-#else
-	// Fallback for older liburing without timeout support
-	int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
-#endif
+	int ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, (struct __kernel_timespec *) timeout);
 
 	if (ret < 0) {
 		return ret;
@@ -249,27 +239,11 @@ static void ior_uring_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_
 }
 
 static void ior_uring_backend_prep_timeout(
-		ior_sqe *sqe, struct timespec *ts, unsigned count, unsigned flags)
+		ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
 
-#ifdef __kernel_timespec
-	struct __kernel_timespec kts;
-	if (ts) {
-		kts.tv_sec = ts->tv_sec;
-		kts.tv_nsec = ts->tv_nsec;
-	}
-	io_uring_prep_timeout(s, ts ? &kts : NULL, count, flags);
-#else
-	// Older liburing might not have this
-	memset(s, 0, sizeof(*s));
-	s->opcode = IORING_OP_TIMEOUT;
-	s->fd = -1;
-	s->addr = (uint64_t) (uintptr_t) ts;
-	s->len = 1;
-	s->off = count;
-	s->timeout_flags = flags;
-#endif
+	io_uring_prep_timeout(s, (struct __kernel_timespec *) ts, count, flags);
 }
 
 static void ior_uring_backend_sqe_set_data(ior_sqe *sqe, void *data)
@@ -289,7 +263,7 @@ static void ior_uring_backend_sqe_set_flags(ior_sqe *sqe, uint8_t flags)
 static void *ior_uring_backend_cqe_get_data(ior_cqe *cqe)
 {
 	ior_cqe_uring *c = &cqe->uring;
-	return io_uring_cqe_get_data(c);
+	return io_uring_cqe_get_data((const struct io_uring_cqe *) c);
 }
 
 static int32_t ior_uring_backend_cqe_get_res(ior_cqe *cqe)
