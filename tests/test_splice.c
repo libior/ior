@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
 
-#ifdef IOR_HAVE_SPLICE
-
 static void test_splice_basic(void **state)
 {
 	test_state *ts = (test_state *) *state;
+
+	// Check if backend supports splice
+	uint32_t features = ior_get_features(ts->ctx);
+	if (!(features & IOR_FEAT_SPLICE)) {
+		skip();
+		return;
+	}
 
 	// Create a pipe
 	int pipefd[2];
@@ -34,7 +39,8 @@ static void test_splice_basic(void **state)
 	ret = ior_wait_cqe(ts->ctx, &cqe);
 	assert_return_code(ret, 0);
 
-	assert_int_equal(ior_cqe_get_res(ts->ctx, cqe), len);
+	int32_t res = ior_cqe_get_res(ts->ctx, cqe);
+	assert_int_equal(res, len);
 
 	ior_cqe_seen(ts->ctx, cqe);
 
@@ -48,18 +54,11 @@ static void test_splice_basic(void **state)
 	close(pipefd[1]);
 }
 
-#endif /* IOR_HAVE_SPLICE */
-
 int main(void)
 {
-#ifdef IOR_HAVE_SPLICE
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test_setup_teardown(test_splice_basic, setup_temp_file, teardown_temp_file),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);
-#else
-	printf("Splice tests skipped (not supported on this platform)\n");
-	return 0;
-#endif
 }

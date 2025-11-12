@@ -63,7 +63,7 @@ typedef enum {
 #define IOR_FEAT_POLL_ADD (1U << 3)
 #define IOR_FEAT_SQPOLL (1U << 4)
 
-#define IOR_SPLICE_OFF_NONE ((uint64_t)-1)
+#define IOR_SPLICE_OFF_NONE ((uint64_t) -1)
 
 /* Forward declarations - OPAQUE TYPES */
 typedef struct ior_ctx ior_ctx;

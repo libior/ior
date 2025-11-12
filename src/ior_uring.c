@@ -55,9 +55,7 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	}
 #endif
 
-#ifdef IOR_HAVE_SPLICE
 	ctx->features |= IOR_FEAT_SPLICE;
-#endif
 
 	params->features = ctx->features;
 	*backend_ctx = ctx;
