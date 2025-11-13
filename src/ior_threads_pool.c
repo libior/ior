@@ -7,7 +7,6 @@
 #endif
 #include "ior_backend.h"
 #include "ior_threads_pool.h"
-#include "ior_threads_ring.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -16,9 +15,9 @@
 
 // Forward declarations
 static void *ior_threads_pool_worker_thread_func(void *arg);
-static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_sqe_id);
+static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_position);
 static void ior_threads_pool_process_single_sqe(
-		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, uint64_t sqe_id);
+		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static int ior_threads_pool_try_create_thread(ior_threads_pool *pool);
 #ifndef IOR_HAVE_SPLICE
@@ -29,9 +28,8 @@ static ssize_t ior_threads_pool_emulate_splice(
 ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_threads)
 {
 	ior_threads_pool_config config = {
-		.num_threads = 0, // Don't create any threads by default
-		.max_threads = num_threads > 0 ? num_threads : 32,
 		.min_threads = 0,
+		.max_threads = num_threads > 0 ? num_threads : 32,
 		.stack_size = 0,
 		.thread_priority = 0,
 	};
@@ -63,22 +61,14 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pool->num_threads_min = pool->num_threads_max;
 	}
 
-	pool->thread_create_cooldown_ms = 50; // Default 50ms cooldown
+	pool->thread_create_cooldown_ms = 50;
 
-	// Initialize synchronization primitives
 	if (pthread_mutex_init(&pool->pool_lock, NULL) != 0) {
 		free(pool);
 		return NULL;
 	}
 
-	if (pthread_mutex_init(&pool->sqe_lock, NULL) != 0) {
-		pthread_mutex_destroy(&pool->pool_lock);
-		free(pool);
-		return NULL;
-	}
-
 	if (pthread_cond_init(&pool->work_cond, NULL) != 0) {
-		pthread_mutex_destroy(&pool->sqe_lock);
 		pthread_mutex_destroy(&pool->pool_lock);
 		free(pool);
 		return NULL;
@@ -86,10 +76,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 
 	atomic_init(&pool->shutdown, 0);
 	atomic_init(&pool->tasks_completed, 0);
-	atomic_init(&pool->tasks_in_progress, 0);
-	atomic_init(&pool->last_completed_sqe_id, 0);
 
-	pool->next_sqe_id = 1;
 	pool->threads = NULL;
 	pool->num_threads_current = 0;
 	pool->num_threads_idle = 0;
@@ -135,14 +122,19 @@ ior_threads_pool *ior_threads_pool_create_ex(
 
 void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 {
-	if (!pool || count == 0) {
+	if (!pool) {
 		return;
+	}
+
+	// Submit all pending SQEs first
+	if (count > 0) {
+		ior_threads_ring_submit(&pool->ctx->sq_ring);
 	}
 
 	pthread_mutex_lock(&pool->pool_lock);
 
 	// Check if we need more threads
-	uint32_t pending = ior_threads_ring_cached_count(&pool->ctx->sq_ring);
+	uint32_t pending = ior_threads_ring_count(&pool->ctx->sq_ring);
 	uint32_t idle = pool->num_threads_idle;
 
 	// If we have pending work and no idle threads, try to create more
@@ -187,7 +179,6 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 
 	// Cleanup
 	pthread_cond_destroy(&pool->work_cond);
-	pthread_mutex_destroy(&pool->sqe_lock);
 	pthread_mutex_destroy(&pool->pool_lock);
 	free(pool);
 }
@@ -240,34 +231,13 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 			break;
 		}
 
-		int got_work = 0;
-		uint64_t sqe_id = 0;
+		uint64_t sqe_position = 0;
 
-		// Try to get work from SQ ring with proper locking
-		pthread_mutex_lock(&pool->sqe_lock);
+		// Try to pick work from SQ ring
+		ior_sqe *sqe = ior_threads_ring_pick_sqe(&ctx->sq_ring, &sqe_position);
 
-		ior_sqe *sqe = ior_threads_ring_peek_sqe(&ctx->sq_ring);
 		if (sqe) {
-			// Check for DRAIN flag
-			if (sqe->threads.flags & IOR_SQE_IO_DRAIN) {
-				uint64_t last_completed = atomic_load(&pool->last_completed_sqe_id);
-				if (pool->next_sqe_id - 1 > last_completed) {
-					// Not ready yet, unlock and wait
-					pthread_mutex_unlock(&pool->sqe_lock);
-					usleep(100);
-					continue;
-				}
-			}
-
-			// Assign ID and mark as being processed
-			sqe_id = pool->next_sqe_id++;
-			got_work = 1;
-		}
-
-		pthread_mutex_unlock(&pool->sqe_lock);
-
-		if (got_work) {
-			// Mark thread as active
+			// Got work
 			pthread_mutex_lock(&pool->pool_lock);
 			pool->num_threads_idle--;
 			pthread_mutex_unlock(&pool->pool_lock);
@@ -275,8 +245,8 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_ACTIVE);
 			gettimeofday(&last_work_time, NULL);
 
-			// Process SQE chain
-			int processed = ior_threads_pool_process_sqe_chain(pool, sqe_id);
+			// Process SQE chain (handles LINK)
+			int processed = ior_threads_pool_process_sqe_chain(pool, sqe_position);
 
 			worker->tasks_completed += processed;
 
@@ -327,49 +297,60 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 
 // ===== Operation Processing =====
 
-static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_sqe_id)
+static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_position)
 {
 	ior_ctx_threads *ctx = pool->ctx;
 	int count = 0;
-	uint64_t current_sqe_id = start_sqe_id;
+	uint64_t current_position = start_position;
 	int continue_chain = 1;
 
 	while (continue_chain) {
 		continue_chain = 0;
 
-		pthread_mutex_lock(&pool->sqe_lock);
+		// Pick next SQE in chain
+		uint64_t next_position;
+		ior_sqe *sqe = (current_position == start_position) ? NULL : // First SQE already picked
+				ior_threads_ring_pick_sqe(&ctx->sq_ring, &next_position);
 
-		ior_sqe *sqe = ior_threads_ring_peek_sqe(&ctx->sq_ring);
+		// For first iteration, we already have the SQE from worker
+		if (current_position == start_position) {
+			// Need to peek at the already-picked SQE
+			// Since we have the position, calculate index
+			uint32_t index = current_position & ctx->sq_ring.mask;
+			ior_sqe *sqes = (ior_sqe *) ctx->sq_ring.entries;
+			sqe = &sqes[index];
+		}
+
 		if (!sqe) {
-			pthread_mutex_unlock(&pool->sqe_lock);
 			break;
 		}
 
 		// Make a copy of the SQE
 		ior_sqe sqe_copy = *sqe;
 		int has_link = (sqe_copy.threads.flags & IOR_SQE_IO_LINK) != 0;
+		int has_drain = (sqe_copy.threads.flags & IOR_SQE_IO_DRAIN) != 0;
 
-		// Consume the SQE
-		ior_threads_ring_consume_sqe(&ctx->sq_ring);
-
-		pthread_mutex_unlock(&pool->sqe_lock);
+		// Handle DRAIN: wait until all prior SQEs complete
+		if (has_drain) {
+			ior_threads_ring_wait_until_head(&ctx->sq_ring, current_position);
+		}
 
 		// Process this SQE
 		ior_cqe cqe;
-		ior_threads_pool_process_single_sqe(pool, &sqe_copy, &cqe, current_sqe_id);
+		ior_threads_pool_process_single_sqe(pool, &sqe_copy, &cqe);
 
 		// Post completion
 		ior_threads_pool_post_completion(pool, &cqe);
 
-		// Update completion tracking
-		atomic_store(&pool->last_completed_sqe_id, current_sqe_id);
+		// Mark this SQE as completed
+		ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
 
 		count++;
-		current_sqe_id++;
 
 		// If this SQE had IO_LINK flag and succeeded, continue to next
 		if (has_link && cqe.threads.res >= 0) {
 			continue_chain = 1;
+			current_position = next_position;
 		}
 	}
 
@@ -379,10 +360,9 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 }
 
 static void ior_threads_pool_process_single_sqe(
-		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, uint64_t sqe_id)
+		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe)
 {
 	(void) pool;
-	(void) sqe_id;
 
 	memset(cqe, 0, sizeof(*cqe));
 	cqe->threads.user_data = sqe->threads.user_data;
@@ -462,23 +442,18 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 	int ret = ior_threads_ring_post_cqe(&ctx->cq_ring, cqe);
 
 	if (ret == -EOVERFLOW) {
-		// CQ ring full - this means the application isn't consuming fast enough
-		// We use exponential backoff similar to io_uring's approach
-		// In io_uring, this would trigger -EBUSY on submission
-		// Here, we wait for space since we can't fail the completion
-
-		int backoff_us = 100; // Start with 100 microseconds
-		const int max_backoff_us = 10000; // Cap at 10ms
+		// CQ ring full - exponential backoff
+		int backoff_us = 100;
+		const int max_backoff_us = 10000;
 
 		while (ior_threads_ring_post_cqe(&ctx->cq_ring, cqe) == -EOVERFLOW) {
 			usleep(backoff_us);
 
-			// Exponential backoff with cap
 			if (backoff_us < max_backoff_us) {
 				backoff_us *= 2;
 			}
 
-			// Signal event to wake consumer (application)
+			// Signal event to wake consumer
 			ior_threads_event_signal(&ctx->event);
 		}
 	}
@@ -536,7 +511,7 @@ static int ior_threads_pool_try_create_thread(ior_threads_pool *pool)
 static ssize_t ior_threads_pool_emulate_splice(
 		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags)
 {
-	(void) flags; // Ignore flags for emulation
+	(void) flags;
 
 	const size_t BUFFER_SIZE = 65536; // 64KB buffer
 	char *buffer = malloc(BUFFER_SIZE);
