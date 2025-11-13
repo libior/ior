@@ -6,64 +6,32 @@
 #include <unistd.h>
 #endif
 #include "ior_backend.h"
-#include "ior_threads.h"
+#include "ior_threads_pool.h"
+#include "ior_threads_ring.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-
-// Work item structure
-typedef struct ior_work_item {
-	ior_sqe sqe; // Copy of submission queue entry
-	ior_ctx_threads *ctx; // Context for posting completion
-} ior_work_item;
-
-// Thread pool structure
-struct ior_threads_pool {
-	ior_ctx_threads *ctx; // Parent context
-
-	pthread_t *threads; // Worker threads
-	uint32_t num_threads; // Number of threads
-
-	// Work notification
-	pthread_mutex_t work_lock; // Protects work_available condition
-	pthread_cond_t work_cond; // Signals new work available
-
-	// Shutdown flag
-	_Atomic int shutdown; // Set to 1 to shutdown pool
-
-	// Statistics
-	_Atomic uint64_t tasks_completed;
-	_Atomic uint32_t threads_active;
-};
+#include <sys/time.h>
 
 // Forward declarations
-static void *worker_thread_func(void *arg);
-static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe);
-static void post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
-
-// Auto-detect number of threads based on CPU count
-static uint32_t get_default_thread_count(void)
-{
-	long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-	if (nprocs <= 0) {
-		return 4; // Default fallback
-	}
-
-	// Use number of CPUs, but cap at reasonable limit
-	uint32_t count = (uint32_t) nprocs;
-	if (count > 64) {
-		count = 64; // Max 64 threads
-	}
-
-	return count;
-}
+static void *ior_threads_pool_worker_thread_func(void *arg);
+static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_sqe_id);
+static void ior_threads_pool_process_single_sqe(
+		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, uint64_t sqe_id);
+static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
+static int ior_threads_pool_try_create_thread(ior_threads_pool *pool);
+#ifndef IOR_HAVE_SPLICE
+static ssize_t ior_threads_pool_emulate_splice(
+		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);
+#endif
 
 ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_threads)
 {
 	ior_threads_pool_config config = {
-		.num_threads = num_threads,
-		.max_threads = num_threads,
+		.num_threads = 0, // Don't create any threads by default
+		.max_threads = num_threads > 0 ? num_threads : 32,
+		.min_threads = 0,
 		.stack_size = 0,
 		.thread_priority = 0,
 	};
@@ -84,38 +52,51 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	}
 
 	pool->ctx = ctx;
-	pool->num_threads = config->num_threads;
+	pool->num_threads_min = config->min_threads;
+	pool->num_threads_max = config->max_threads;
 
-	if (pool->num_threads == 0) {
-		pool->num_threads = get_default_thread_count();
+	if (pool->num_threads_max == 0) {
+		pool->num_threads_max = 32;
 	}
 
+	if (pool->num_threads_min > pool->num_threads_max) {
+		pool->num_threads_min = pool->num_threads_max;
+	}
+
+	pool->thread_create_cooldown_ms = 50; // Default 50ms cooldown
+
 	// Initialize synchronization primitives
-	if (pthread_mutex_init(&pool->work_lock, NULL) != 0) {
+	if (pthread_mutex_init(&pool->pool_lock, NULL) != 0) {
+		free(pool);
+		return NULL;
+	}
+
+	if (pthread_mutex_init(&pool->sqe_lock, NULL) != 0) {
+		pthread_mutex_destroy(&pool->pool_lock);
 		free(pool);
 		return NULL;
 	}
 
 	if (pthread_cond_init(&pool->work_cond, NULL) != 0) {
-		pthread_mutex_destroy(&pool->work_lock);
+		pthread_mutex_destroy(&pool->sqe_lock);
+		pthread_mutex_destroy(&pool->pool_lock);
 		free(pool);
 		return NULL;
 	}
 
 	atomic_init(&pool->shutdown, 0);
 	atomic_init(&pool->tasks_completed, 0);
-	atomic_init(&pool->threads_active, 0);
+	atomic_init(&pool->tasks_in_progress, 0);
+	atomic_init(&pool->last_completed_sqe_id, 0);
 
-	// Allocate thread array
-	pool->threads = calloc(pool->num_threads, sizeof(pthread_t));
-	if (!pool->threads) {
-		pthread_cond_destroy(&pool->work_cond);
-		pthread_mutex_destroy(&pool->work_lock);
-		free(pool);
-		return NULL;
-	}
+	pool->next_sqe_id = 1;
+	pool->threads = NULL;
+	pool->num_threads_current = 0;
+	pool->num_threads_idle = 0;
 
-	// Create worker threads
+	gettimeofday(&pool->last_thread_create, NULL);
+
+	// Create minimum number of threads if specified
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 
@@ -123,26 +104,29 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_attr_setstacksize(&attr, config->stack_size);
 	}
 
-	for (uint32_t i = 0; i < pool->num_threads; i++) {
-		int ret = pthread_create(&pool->threads[i], &attr, worker_thread_func, pool);
-		if (ret != 0) {
-			// Failed to create thread, cleanup
-			atomic_store(&pool->shutdown, 1);
-			pthread_cond_broadcast(&pool->work_cond);
-
-			// Wait for already created threads
-			for (uint32_t j = 0; j < i; j++) {
-				pthread_join(pool->threads[j], NULL);
-			}
-
-			pthread_attr_destroy(&attr);
-			free(pool->threads);
-			pthread_cond_destroy(&pool->work_cond);
-			pthread_mutex_destroy(&pool->work_lock);
-			free(pool);
-			return NULL;
+	pthread_mutex_lock(&pool->pool_lock);
+	for (uint32_t i = 0; i < pool->num_threads_min; i++) {
+		ior_threads_pool_worker_thread_t *worker = calloc(1, sizeof(*worker));
+		if (!worker) {
+			break;
 		}
+
+		worker->pool = pool;
+		atomic_init(&worker->state, IOR_THREADS_POOL_THREAD_STATE_IDLE);
+
+		int ret = pthread_create(
+				&worker->thread_id, &attr, ior_threads_pool_worker_thread_func, worker);
+		if (ret != 0) {
+			free(worker);
+			break;
+		}
+
+		worker->next = pool->threads;
+		pool->threads = worker;
+		pool->num_threads_current++;
+		pool->num_threads_idle++;
 	}
+	pthread_mutex_unlock(&pool->pool_lock);
 
 	pthread_attr_destroy(&attr);
 
@@ -155,10 +139,20 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		return;
 	}
 
-	// Signal worker threads that work is available
-	pthread_mutex_lock(&pool->work_lock);
-	pthread_cond_broadcast(&pool->work_cond); // Wake all threads
-	pthread_mutex_unlock(&pool->work_lock);
+	pthread_mutex_lock(&pool->pool_lock);
+
+	// Check if we need more threads
+	uint32_t pending = ior_threads_ring_cached_count(&pool->ctx->sq_ring);
+	uint32_t idle = pool->num_threads_idle;
+
+	// If we have pending work and no idle threads, try to create more
+	if (pending > 0 && idle == 0 && pool->num_threads_current < pool->num_threads_max) {
+		ior_threads_pool_try_create_thread(pool);
+	}
+
+	// Wake up all idle threads
+	pthread_cond_broadcast(&pool->work_cond);
+	pthread_mutex_unlock(&pool->pool_lock);
 }
 
 void ior_threads_pool_destroy(ior_threads_pool *pool)
@@ -171,25 +165,44 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	atomic_store(&pool->shutdown, 1);
 
 	// Wake all threads
-	pthread_mutex_lock(&pool->work_lock);
+	pthread_mutex_lock(&pool->pool_lock);
 	pthread_cond_broadcast(&pool->work_cond);
-	pthread_mutex_unlock(&pool->work_lock);
+	pthread_mutex_unlock(&pool->pool_lock);
 
 	// Wait for all threads to finish
-	for (uint32_t i = 0; i < pool->num_threads; i++) {
-		pthread_join(pool->threads[i], NULL);
+	pthread_mutex_lock(&pool->pool_lock);
+	ior_threads_pool_worker_thread_t *worker = pool->threads;
+	while (worker) {
+		ior_threads_pool_worker_thread_t *next = worker->next;
+		pthread_mutex_unlock(&pool->pool_lock);
+
+		pthread_join(worker->thread_id, NULL);
+		free(worker);
+
+		pthread_mutex_lock(&pool->pool_lock);
+		worker = next;
 	}
+	pool->threads = NULL;
+	pthread_mutex_unlock(&pool->pool_lock);
 
 	// Cleanup
-	free(pool->threads);
 	pthread_cond_destroy(&pool->work_cond);
-	pthread_mutex_destroy(&pool->work_lock);
+	pthread_mutex_destroy(&pool->sqe_lock);
+	pthread_mutex_destroy(&pool->pool_lock);
 	free(pool);
 }
 
 uint32_t ior_threads_pool_get_num_threads(ior_threads_pool *pool)
 {
-	return pool ? pool->num_threads : 0;
+	if (!pool) {
+		return 0;
+	}
+
+	pthread_mutex_lock(&pool->pool_lock);
+	uint32_t count = pool->num_threads_current;
+	pthread_mutex_unlock(&pool->pool_lock);
+
+	return count;
 }
 
 void ior_threads_pool_get_stats(ior_threads_pool *pool, ior_threads_pool_stats *stats)
@@ -200,20 +213,26 @@ void ior_threads_pool_get_stats(ior_threads_pool *pool, ior_threads_pool_stats *
 
 	memset(stats, 0, sizeof(*stats));
 
-	stats->tasks_completed = atomic_load(&pool->tasks_completed);
-	stats->threads_active = atomic_load(&pool->threads_active);
-	stats->threads_idle = pool->num_threads - stats->threads_active;
+	pthread_mutex_lock(&pool->pool_lock);
+	stats->threads_active = pool->num_threads_current - pool->num_threads_idle;
+	stats->threads_idle = pool->num_threads_idle;
+	pthread_mutex_unlock(&pool->pool_lock);
 
-	// Pending tasks = items in SQ ring
+	stats->tasks_completed = atomic_load(&pool->tasks_completed);
 	stats->tasks_pending = ior_threads_ring_count(&pool->ctx->sq_ring);
 }
 
 // ===== Worker Thread Implementation =====
 
-static void *worker_thread_func(void *arg)
+static void *ior_threads_pool_worker_thread_func(void *arg)
 {
-	ior_threads_pool *pool = (ior_threads_pool *) arg;
+	ior_threads_pool_worker_thread_t *worker = (ior_threads_pool_worker_thread_t *) arg;
+	ior_threads_pool *pool = worker->pool;
 	ior_ctx_threads *ctx = pool->ctx;
+
+	struct timeval last_work_time;
+	gettimeofday(&last_work_time, NULL);
+	const uint32_t idle_timeout_ms = 30000; // 30 seconds
 
 	while (1) {
 		// Check for shutdown
@@ -221,45 +240,85 @@ static void *worker_thread_func(void *arg)
 			break;
 		}
 
-		// Try to get work from SQ ring
+		int got_work = 0;
+		uint64_t sqe_id = 0;
+
+		// Try to get work from SQ ring with proper locking
+		pthread_mutex_lock(&pool->sqe_lock);
+
 		ior_sqe *sqe = ior_threads_ring_peek_sqe(&ctx->sq_ring);
-
 		if (sqe) {
-			// Got work - mark thread as active
-			atomic_fetch_add(&pool->threads_active, 1);
+			// Check for DRAIN flag
+			if (sqe->threads.flags & IOR_SQE_IO_DRAIN) {
+				uint64_t last_completed = atomic_load(&pool->last_completed_sqe_id);
+				if (pool->next_sqe_id - 1 > last_completed) {
+					// Not ready yet, unlock and wait
+					pthread_mutex_unlock(&pool->sqe_lock);
+					usleep(100);
+					continue;
+				}
+			}
 
-			// Make a copy of the SQE (so ring slot can be reused)
-			ior_sqe sqe_copy = *sqe;
+			// Assign ID and mark as being processed
+			sqe_id = pool->next_sqe_id++;
+			got_work = 1;
+		}
 
-			// Mark SQE as consumed
-			ior_threads_ring_consume_sqe(&ctx->sq_ring);
+		pthread_mutex_unlock(&pool->sqe_lock);
 
-			// Process the operation
-			process_sqe(pool, &sqe_copy);
+		if (got_work) {
+			// Mark thread as active
+			pthread_mutex_lock(&pool->pool_lock);
+			pool->num_threads_idle--;
+			pthread_mutex_unlock(&pool->pool_lock);
 
-			// Mark thread as idle
-			atomic_fetch_sub(&pool->threads_active, 1);
-			atomic_fetch_add(&pool->tasks_completed, 1);
+			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_ACTIVE);
+			gettimeofday(&last_work_time, NULL);
+
+			// Process SQE chain
+			int processed = ior_threads_pool_process_sqe_chain(pool, sqe_id);
+
+			worker->tasks_completed += processed;
+
+			// Mark thread as idle again
+			pthread_mutex_lock(&pool->pool_lock);
+			pool->num_threads_idle++;
+			pthread_mutex_unlock(&pool->pool_lock);
+
+			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_IDLE);
 
 		} else {
-			// No work available - wait for notification
-			pthread_mutex_lock(&pool->work_lock);
+			// No work available
+			pthread_mutex_lock(&pool->pool_lock);
 
-			// Double-check shutdown flag while holding lock
+			// Double-check shutdown
 			if (atomic_load(&pool->shutdown)) {
-				pthread_mutex_unlock(&pool->work_lock);
+				pthread_mutex_unlock(&pool->pool_lock);
 				break;
 			}
 
-			// Check again if work appeared
-			if (!ior_threads_ring_empty(&ctx->sq_ring)) {
-				pthread_mutex_unlock(&pool->work_lock);
-				continue;
+			// Check if we should exit due to being excess thread
+			struct timeval now;
+			gettimeofday(&now, NULL);
+			long idle_ms = (now.tv_sec - last_work_time.tv_sec) * 1000
+					+ (now.tv_usec - last_work_time.tv_usec) / 1000;
+
+			if (pool->num_threads_current > pool->num_threads_min && idle_ms > idle_timeout_ms) {
+				// This thread has been idle too long, exit
+				atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_STOPPING);
+				pool->num_threads_current--;
+				pool->num_threads_idle--;
+				pthread_mutex_unlock(&pool->pool_lock);
+				break;
 			}
 
-			// Wait for work or shutdown
-			pthread_cond_wait(&pool->work_cond, &pool->work_lock);
-			pthread_mutex_unlock(&pool->work_lock);
+			// Wait for work with timeout
+			struct timespec timeout;
+			timeout.tv_sec = now.tv_sec + 1;
+			timeout.tv_nsec = now.tv_usec * 1000;
+
+			pthread_cond_timedwait(&pool->work_cond, &pool->pool_lock, &timeout);
+			pthread_mutex_unlock(&pool->pool_lock);
 		}
 	}
 
@@ -268,39 +327,88 @@ static void *worker_thread_func(void *arg)
 
 // ===== Operation Processing =====
 
-static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
+static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_sqe_id)
 {
-	ior_cqe cqe = { .threads = {
-							.user_data = sqe->threads.user_data,
-							.res = 0,
-							.flags = 0,
-					} };
+	ior_ctx_threads *ctx = pool->ctx;
+	int count = 0;
+	uint64_t current_sqe_id = start_sqe_id;
+	int continue_chain = 1;
+
+	while (continue_chain) {
+		continue_chain = 0;
+
+		pthread_mutex_lock(&pool->sqe_lock);
+
+		ior_sqe *sqe = ior_threads_ring_peek_sqe(&ctx->sq_ring);
+		if (!sqe) {
+			pthread_mutex_unlock(&pool->sqe_lock);
+			break;
+		}
+
+		// Make a copy of the SQE
+		ior_sqe sqe_copy = *sqe;
+		int has_link = (sqe_copy.threads.flags & IOR_SQE_IO_LINK) != 0;
+
+		// Consume the SQE
+		ior_threads_ring_consume_sqe(&ctx->sq_ring);
+
+		pthread_mutex_unlock(&pool->sqe_lock);
+
+		// Process this SQE
+		ior_cqe cqe;
+		ior_threads_pool_process_single_sqe(pool, &sqe_copy, &cqe, current_sqe_id);
+
+		// Post completion
+		ior_threads_pool_post_completion(pool, &cqe);
+
+		// Update completion tracking
+		atomic_store(&pool->last_completed_sqe_id, current_sqe_id);
+
+		count++;
+		current_sqe_id++;
+
+		// If this SQE had IO_LINK flag and succeeded, continue to next
+		if (has_link && cqe.threads.res >= 0) {
+			continue_chain = 1;
+		}
+	}
+
+	atomic_fetch_add(&pool->tasks_completed, count);
+
+	return count;
+}
+
+static void ior_threads_pool_process_single_sqe(
+		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, uint64_t sqe_id)
+{
+	(void) pool;
+	(void) sqe_id;
+
+	memset(cqe, 0, sizeof(*cqe));
+	cqe->threads.user_data = sqe->threads.user_data;
+	cqe->threads.flags = 0;
 
 	// Process based on operation type
 	switch (sqe->threads.opcode) {
 		case IOR_OP_NOP:
-			// No-op: just complete successfully
-			cqe.threads.res = 0;
+			cqe->threads.res = 0;
 			break;
 
 		case IOR_OP_READ: {
-			// Perform blocking read
 			ssize_t ret = pread(sqe->threads.fd, (void *) (uintptr_t) sqe->threads.addr,
 					sqe->threads.len, sqe->threads.off);
-			cqe.threads.res = (ret < 0) ? -errno : ret;
+			cqe->threads.res = (ret < 0) ? -errno : ret;
 			break;
 		}
 
 		case IOR_OP_WRITE: {
-			// Perform blocking write
 			ssize_t ret = pwrite(sqe->threads.fd, (const void *) (uintptr_t) sqe->threads.addr,
 					sqe->threads.len, sqe->threads.off);
-			cqe.threads.res = (ret < 0) ? -errno : ret;
+			cqe->threads.res = (ret < 0) ? -errno : ret;
 			break;
 		}
 
 		case IOR_OP_TIMER: {
-			// Sleep for specified time
 			ior_timespec *ts = (ior_timespec *) (uintptr_t) sqe->threads.addr;
 			if (ts) {
 				struct timespec sts = {
@@ -308,62 +416,187 @@ static void process_sqe(ior_threads_pool *pool, const ior_sqe *sqe)
 					.tv_nsec = ts->tv_nsec,
 				};
 				nanosleep(&sts, NULL);
-				cqe.threads.res = 0;
+				cqe->threads.res = 0;
 			} else {
-				cqe.threads.res = -EINVAL;
+				cqe->threads.res = -EINVAL;
 			}
 			break;
 		}
 
 		case IOR_OP_SPLICE: {
-			// Splice between two file descriptors
 #ifdef IOR_HAVE_SPLICE
 			ssize_t ret = splice(sqe->threads.splice_fd_in,
 					(loff_t *) (sqe->threads.addr ? &sqe->threads.addr : NULL), sqe->threads.fd,
 					(loff_t *) (sqe->threads.off ? &sqe->threads.off : NULL), sqe->threads.len,
 					sqe->threads.splice_flags);
-			cqe.threads.res = (ret < 0) ? -errno : ret;
+			cqe->threads.res = (ret < 0) ? -errno : ret;
 #else
-			// splice not available on non-Linux
-			// TODO: emulate it
-			cqe.threads.res = -ENOSYS;
+			// Emulate splice using read/write loop
+			ssize_t ret = ior_threads_pool_emulate_splice(sqe->threads.splice_fd_in,
+					(loff_t *) (sqe->threads.addr ? &sqe->threads.addr : NULL), sqe->threads.fd,
+					(loff_t *) (sqe->threads.off ? &sqe->threads.off : NULL), sqe->threads.len,
+					sqe->threads.splice_flags);
+			cqe->threads.res = (ret < 0) ? -errno : ret;
 #endif
 			break;
 		}
 
-		// Stage 2 operations (placeholders for now)
 		case IOR_OP_ACCEPT:
 		case IOR_OP_CONNECT:
 		case IOR_OP_LISTEN:
 		case IOR_OP_BIND:
-			cqe.threads.res = -ENOSYS; // Not yet implemented
+			cqe->threads.res = -ENOSYS;
 			break;
 
 		default:
-			cqe.threads.res = -EINVAL; // Unknown operation
+			cqe->threads.res = -EINVAL;
 			break;
 	}
-
-	// Post completion
-	post_completion(pool, &cqe);
 }
 
-static void post_completion(ior_threads_pool *pool, const ior_cqe *cqe)
+static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe)
 {
 	ior_ctx_threads *ctx = pool->ctx;
 
-	// Post CQE to completion ring
+	// Try to post CQE to completion ring
 	int ret = ior_threads_ring_post_cqe(&ctx->cq_ring, cqe);
 
 	if (ret == -EOVERFLOW) {
-		// CQ ring full - this is a serious problem
-		// In production, might want to log or handle this differently
-		// For now, busy-wait until space available
+		// CQ ring full - this means the application isn't consuming fast enough
+		// We use exponential backoff similar to io_uring's approach
+		// In io_uring, this would trigger -EBUSY on submission
+		// Here, we wait for space since we can't fail the completion
+
+		int backoff_us = 100; // Start with 100 microseconds
+		const int max_backoff_us = 10000; // Cap at 10ms
+
 		while (ior_threads_ring_post_cqe(&ctx->cq_ring, cqe) == -EOVERFLOW) {
-			usleep(100); // Brief sleep to avoid burning CPU
+			usleep(backoff_us);
+
+			// Exponential backoff with cap
+			if (backoff_us < max_backoff_us) {
+				backoff_us *= 2;
+			}
+
+			// Signal event to wake consumer (application)
+			ior_threads_event_signal(&ctx->event);
 		}
 	}
 
 	// Signal event to wake waiting thread
 	ior_threads_event_signal(&ctx->event);
 }
+
+static int ior_threads_pool_try_create_thread(ior_threads_pool *pool)
+{
+	// Must be called with pool_lock held
+
+	if (pool->num_threads_current >= pool->num_threads_max) {
+		return -EAGAIN;
+	}
+
+	// Check cooldown period
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	long ms_since_last = (now.tv_sec - pool->last_thread_create.tv_sec) * 1000
+			+ (now.tv_usec - pool->last_thread_create.tv_usec) / 1000;
+
+	if (ms_since_last < (long) pool->thread_create_cooldown_ms) {
+		return -EAGAIN;
+	}
+
+	ior_threads_pool_worker_thread_t *worker = calloc(1, sizeof(*worker));
+	if (!worker) {
+		return -ENOMEM;
+	}
+
+	worker->pool = pool;
+	atomic_init(&worker->state, IOR_THREADS_POOL_THREAD_STATE_IDLE);
+
+	int ret = pthread_create(&worker->thread_id, NULL, ior_threads_pool_worker_thread_func, worker);
+	if (ret != 0) {
+		free(worker);
+		return -ret;
+	}
+
+	// Add to linked list
+	worker->next = pool->threads;
+	pool->threads = worker;
+	pool->num_threads_current++;
+	pool->num_threads_idle++;
+
+	pool->last_thread_create = now;
+
+	return 0;
+}
+
+// ===== Splice Emulation =====
+
+#ifndef IOR_HAVE_SPLICE
+static ssize_t ior_threads_pool_emulate_splice(
+		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags)
+{
+	(void) flags; // Ignore flags for emulation
+
+	const size_t BUFFER_SIZE = 65536; // 64KB buffer
+	char *buffer = malloc(BUFFER_SIZE);
+	if (!buffer) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	size_t total_transferred = 0;
+
+	while (total_transferred < len) {
+		size_t to_read = len - total_transferred;
+		if (to_read > BUFFER_SIZE) {
+			to_read = BUFFER_SIZE;
+		}
+
+		ssize_t nread;
+		if (off_in) {
+			nread = pread(fd_in, buffer, to_read, *off_in);
+			if (nread > 0) {
+				*off_in += nread;
+			}
+		} else {
+			nread = read(fd_in, buffer, to_read);
+		}
+
+		if (nread < 0) {
+			free(buffer);
+			return -1;
+		}
+
+		if (nread == 0) {
+			break; // EOF
+		}
+
+		ssize_t nwritten;
+		if (off_out) {
+			nwritten = pwrite(fd_out, buffer, nread, *off_out);
+			if (nwritten > 0) {
+				*off_out += nwritten;
+			}
+		} else {
+			nwritten = write(fd_out, buffer, nread);
+		}
+
+		if (nwritten < 0) {
+			free(buffer);
+			return -1;
+		}
+
+		if (nwritten != nread) {
+			// Partial write
+			total_transferred += nwritten;
+			break;
+		}
+
+		total_transferred += nwritten;
+	}
+
+	free(buffer);
+	return (ssize_t) total_transferred;
+}
+#endif

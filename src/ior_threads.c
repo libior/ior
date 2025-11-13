@@ -146,7 +146,7 @@ static int ior_threads_backend_submit(void *backend_ctx)
 	ior_ctx_threads *ctx = backend_ctx;
 
 	// Get number of pending submissions
-	uint32_t count = ior_threads_ring_count(&ctx->sq_ring);
+	uint32_t count = ior_threads_ring_cached_count(&ctx->sq_ring);
 	if (count == 0) {
 		return 0;
 	}
