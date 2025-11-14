@@ -59,10 +59,6 @@ struct ior_threads_pool {
 
 	// Statistics
 	_Atomic uint64_t tasks_completed;
-
-	// Thread creation throttling
-	struct timeval last_thread_create;
-	uint32_t thread_create_cooldown_ms;
 };
 
 // Thread pool configuration

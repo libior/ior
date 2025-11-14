@@ -61,8 +61,6 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pool->num_threads_min = pool->num_threads_max;
 	}
 
-	pool->thread_create_cooldown_ms = 50;
-
 	if (pthread_mutex_init(&pool->pool_lock, NULL) != 0) {
 		free(pool);
 		return NULL;
@@ -80,8 +78,6 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	pool->threads = NULL;
 	pool->num_threads_current = 0;
 	pool->num_threads_idle = 0;
-
-	gettimeofday(&pool->last_thread_create, NULL);
 
 	// Create minimum number of threads if specified
 	pthread_attr_t attr;
@@ -504,18 +500,6 @@ static int ior_threads_pool_try_create_thread(ior_threads_pool *pool)
 		return -EAGAIN;
 	}
 
-	// Check cooldown period
-	struct timeval now;
-	gettimeofday(&now, NULL);
-	long ms_since_last = (now.tv_sec - pool->last_thread_create.tv_sec) * 1000
-			+ (now.tv_usec - pool->last_thread_create.tv_usec) / 1000;
-
-	if (ms_since_last < (long) pool->thread_create_cooldown_ms) {
-		IOR_LOG_INFO("cooldown creation attempt: since_last=%ld, cooldown=%u", ms_since_last,
-				pool->thread_create_cooldown_ms);
-		return -EAGAIN;
-	}
-
 	ior_threads_pool_worker_thread_t *worker = calloc(1, sizeof(*worker));
 	if (!worker) {
 		return -ENOMEM;
@@ -535,8 +519,6 @@ static int ior_threads_pool_try_create_thread(ior_threads_pool *pool)
 	pool->threads = worker;
 	pool->num_threads_current++;
 	pool->num_threads_idle++;
-
-	pool->last_thread_create = now;
 
 	return 0;
 }
