@@ -3,6 +3,7 @@
 #define IOR_BACKEND_H
 
 #include "ior.h"
+#include "ior_log.h"
 
 /* Backend-specific SQE structures */
 #ifdef IOR_HAVE_URING

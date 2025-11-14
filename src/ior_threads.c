@@ -146,7 +146,7 @@ static int ior_threads_backend_submit(void *backend_ctx)
 	ior_ctx_threads *ctx = backend_ctx;
 
 	// Get number of pending submissions
-	uint32_t count = ior_threads_ring_cached_count(&ctx->sq_ring);
+	uint32_t count = ior_threads_ring_pending_count(&ctx->sq_ring);
 	if (count == 0) {
 		return 0;
 	}
@@ -165,9 +165,12 @@ static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_
 
 	ior_ctx_threads *ctx = backend_ctx;
 
+	IOR_LOG_TRACE("enter: wait_nr=%u, cq_count=%u", wait_nr, ior_threads_ring_count(&ctx->cq_ring));
+
 	// Submit pending operations
 	int submitted = ior_threads_backend_submit(backend_ctx);
 	if (submitted < 0) {
+		IOR_LOG_ERROR("submit failed: %d", submitted);
 		return submitted;
 	}
 
@@ -178,7 +181,9 @@ static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_
 
 	// Wait for completions to become available
 	while (ior_threads_ring_count(&ctx->cq_ring) < wait_nr) {
+		IOR_LOG_TRACE("event wait start");
 		int ret = ior_threads_event_wait(&ctx->event, -1);
+		IOR_LOG_TRACE("event wait done: ret=%d", ret);
 		if (ret < 0) {
 			return ret;
 		}

@@ -126,6 +126,8 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		return;
 	}
 
+	IOR_LOG_TRACE("enter: count=%u", count);
+
 	// Submit all pending SQEs first
 	if (count > 0) {
 		ior_threads_ring_submit(&pool->ctx->sq_ring);
@@ -139,6 +141,8 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 
 	// If we have pending work and no idle threads, try to create more
 	if (pending > 0 && idle == 0 && pool->num_threads_current < pool->num_threads_max) {
+		IOR_LOG_TRACE("creating thread: pending=%u, idle=%u, nthreads=%u", pending, idle,
+				pool->num_threads_current);
 		ior_threads_pool_try_create_thread(pool);
 	}
 
@@ -225,6 +229,8 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 	gettimeofday(&last_work_time, NULL);
 	const uint32_t idle_timeout_ms = 30000; // 30 seconds
 
+	IOR_LOG_TRACE("thread created");
+
 	while (1) {
 		// Check for shutdown
 		if (atomic_load(&pool->shutdown)) {
@@ -240,6 +246,7 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 			// Got work
 			pthread_mutex_lock(&pool->pool_lock);
 			pool->num_threads_idle--;
+			IOR_LOG_TRACE("pool idle: %u", pool->num_threads_idle);
 			pthread_mutex_unlock(&pool->pool_lock);
 
 			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_ACTIVE);
@@ -250,9 +257,13 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 
 			worker->tasks_completed += processed;
 
+			IOR_LOG_TRACE("active processing: processed=%d, total=%lu", processed,
+					worker->tasks_completed);
+
 			// Mark thread as idle again
 			pthread_mutex_lock(&pool->pool_lock);
 			pool->num_threads_idle++;
+			IOR_LOG_TRACE("pool idle: %u", pool->num_threads_idle);
 			pthread_mutex_unlock(&pool->pool_lock);
 
 			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_IDLE);
@@ -263,6 +274,7 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 
 			// Double-check shutdown
 			if (atomic_load(&pool->shutdown)) {
+				IOR_LOG_TRACE("in shutdown");
 				pthread_mutex_unlock(&pool->pool_lock);
 				break;
 			}
@@ -278,6 +290,8 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 				atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_STOPPING);
 				pool->num_threads_current--;
 				pool->num_threads_idle--;
+				IOR_LOG_TRACE("stopping: threads=%u, idle=%u", pool->num_threads_current,
+						pool->num_threads_idle);
 				pthread_mutex_unlock(&pool->pool_lock);
 				break;
 			}
@@ -312,6 +326,8 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 		ior_sqe *sqe = (current_position == start_position) ? NULL : // First SQE already picked
 				ior_threads_ring_pick_sqe(&ctx->sq_ring, &next_position);
 
+		IOR_LOG_TRACE("processing: sqe=%p", (void *) sqe);
+
 		// For first iteration, we already have the SQE from worker
 		if (current_position == start_position) {
 			// Need to peek at the already-picked SQE
@@ -319,6 +335,7 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 			uint32_t index = current_position & ctx->sq_ring.mask;
 			ior_sqe *sqes = (ior_sqe *) ctx->sq_ring.entries;
 			sqe = &sqes[index];
+			IOR_LOG_TRACE("processing first: index=%u", index);
 		}
 
 		if (!sqe) {
@@ -330,8 +347,11 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 		int has_link = (sqe_copy.threads.flags & IOR_SQE_IO_LINK) != 0;
 		int has_drain = (sqe_copy.threads.flags & IOR_SQE_IO_DRAIN) != 0;
 
+		IOR_LOG_TRACE("processing flags: link=%d, drain=%d", has_link, has_drain);
+
 		// Handle DRAIN: wait until all prior SQEs complete
 		if (has_drain) {
+			IOR_LOG_TRACE("drain waiting: current_pos=%lu", current_position);
 			ior_threads_ring_wait_until_head(&ctx->sq_ring, current_position);
 		}
 
@@ -347,10 +367,13 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 
 		count++;
 
+		IOR_LOG_TRACE("completed: count=%d", count);
+
 		// If this SQE had IO_LINK flag and succeeded, continue to next
 		if (has_link && cqe.threads.res >= 0) {
 			continue_chain = 1;
 			current_position = next_position;
+			IOR_LOG_TRACE("link continue: next_position=%lu", next_position);
 		}
 	}
 
@@ -375,15 +398,21 @@ static void ior_threads_pool_process_single_sqe(
 			break;
 
 		case IOR_OP_READ: {
+			IOR_LOG_TRACE("read start: fd=%d, addr=%p, len=%u, flags=%lu", sqe->threads.fd,
+					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
 			ssize_t ret = pread(sqe->threads.fd, (void *) (uintptr_t) sqe->threads.addr,
 					sqe->threads.len, sqe->threads.off);
+			IOR_LOG_TRACE("read end: res=%ld", ret);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			break;
 		}
 
 		case IOR_OP_WRITE: {
+			IOR_LOG_TRACE("write start: fd=%d, addr=%p, len=%u, flags=%lu", sqe->threads.fd,
+					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
 			ssize_t ret = pwrite(sqe->threads.fd, (const void *) (uintptr_t) sqe->threads.addr,
 					sqe->threads.len, sqe->threads.off);
+			IOR_LOG_TRACE("write end: res=%ld", ret);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			break;
 		}
@@ -395,9 +424,12 @@ static void ior_threads_pool_process_single_sqe(
 					.tv_sec = ts->tv_sec,
 					.tv_nsec = ts->tv_nsec,
 				};
+				IOR_LOG_TRACE("timer start: sec=%ld, nsec=%lld", ts->tv_sec, ts->tv_nsec);
 				nanosleep(&sts, NULL);
+				IOR_LOG_TRACE("timer end: res=0");
 				cqe->threads.res = 0;
 			} else {
+				IOR_LOG_TRACE("timer failed: no addr");
 				cqe->threads.res = -EINVAL;
 			}
 			break;
@@ -442,6 +474,7 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 	int ret = ior_threads_ring_post_cqe(&ctx->cq_ring, cqe);
 
 	if (ret == -EOVERFLOW) {
+		IOR_LOG_WARN("cqe overlow");
 		// CQ ring full - exponential backoff
 		int backoff_us = 100;
 		const int max_backoff_us = 10000;
@@ -458,6 +491,7 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 		}
 	}
 
+	IOR_LOG_TRACE("signaling completion");
 	// Signal event to wake waiting thread
 	ior_threads_event_signal(&ctx->event);
 }
@@ -477,6 +511,8 @@ static int ior_threads_pool_try_create_thread(ior_threads_pool *pool)
 			+ (now.tv_usec - pool->last_thread_create.tv_usec) / 1000;
 
 	if (ms_since_last < (long) pool->thread_create_cooldown_ms) {
+		IOR_LOG_INFO("cooldown creation attempt: since_last=%ld, cooldown=%u", ms_since_last,
+				pool->thread_create_cooldown_ms);
 		return -EAGAIN;
 	}
 
