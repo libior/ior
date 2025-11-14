@@ -20,6 +20,12 @@
 #cmakedefine IOR_FORCE_PIPE
 #cmakedefine IOR_FORCE_THREADS
 
+/* Logging support */
+#cmakedefine IOR_HAVE_LOG
+#ifdef IOR_HAVE_LOG
+#define IOR_LOG_LEVEL @IOR_LOG_LEVEL@
+#endif
+
 /* Version info */
 #define IOR_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
 #define IOR_VERSION_MINOR @PROJECT_VERSION_MINOR@

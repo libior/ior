@@ -68,6 +68,30 @@ option(IOR_BUILD_TESTS "Build test programs" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
 option(IOR_FORCE_THREADS "Force thread backend even if io_uring available (testing)" OFF)
 option(IOR_FORCE_PIPE "Force pipe for thread event notification (testing)" OFF)
+option(IOR_ENABLE_LOG "Enable logging system" OFF)
+
+if(IOR_ENABLE_LOG)
+    set(IOR_HAVE_LOG TRUE)
+    set(IOR_LOG_LEVEL "2" CACHE STRING 
+        "Default log level (0=TRACE, 1=DEBUG, 2=INFO, 3=WARN, 4=ERROR)")
+    set_property(CACHE IOR_LOG_LEVEL PROPERTY STRINGS "0" "1" "2" "3" "4")
+    
+    if(IOR_LOG_LEVEL EQUAL 0)
+        set(IOR_LOG_LEVEL_NAME "TRACE")
+    elseif(IOR_LOG_LEVEL EQUAL 1)
+        set(IOR_LOG_LEVEL_NAME "DEBUG")
+    elseif(IOR_LOG_LEVEL EQUAL 2)
+        set(IOR_LOG_LEVEL_NAME "INFO")
+    elseif(IOR_LOG_LEVEL EQUAL 3)
+        set(IOR_LOG_LEVEL_NAME "WARN")
+    elseif(IOR_LOG_LEVEL EQUAL 4)
+        set(IOR_LOG_LEVEL_NAME "ERROR")
+    endif()
+    
+    message(STATUS "Logging enabled (level: ${IOR_LOG_LEVEL_NAME})")
+else()
+    message(STATUS "Logging disabled")
+endif()
 
 # Platform detection
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

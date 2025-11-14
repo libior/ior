@@ -1,6 +1,7 @@
 # Source files - common
 set(IOR_SOURCES
     ior.c
+    ior_log.c
 )
 
 # Backend selection based on platform and availability

@@ -88,6 +88,8 @@ Configure the build with `-D<OPTION>=<VALUE>`:
 | Option           | Default | Description                                    |
 |------------------|---------|------------------------------------------------|
 | `IOR_FORCE_PIPE` | OFF     | Force pipe instead of eventfd (testing)        |
+| `IOR_ENABLE_LOG` | OFF     | Enable logging system for debugging            |
+| `IOR_LOG_LEVEL`  | 2       | Log level: 0=TRACE, 1=DEBUG, 2=INFO, 3=WARN, 4=ERROR |
 
 ### Sanitizer Options (Debug builds)
 
@@ -110,6 +112,14 @@ cmake --build build
 # Force thread backend (ignore io_uring)
 cmake -B build -DIOR_FORCE_THREADS=ON
 cmake --build build
+
+# Debug build with logging (TRACE level) and threads
+cmake -B build -DIOR_FORCE_THREADS=ON -DCMAKE_BUILD_TYPE=Debug -DIOR_ENABLE_LOG=ON -DIOR_LOG_LEVEL=0
+cmake --build build
+./build/tests/test_read_write 2>&1 | tee debug.log
+
+# Log to file instead of stderr
+IOR_LOG_FILE=./debug.log ./build/tests/test_read_write
 
 # Debug build with AddressSanitizer
 cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DIOR_ENABLE_ASAN=ON
