@@ -13,6 +13,10 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#ifndef __linux__
+typedef off_t loff_t;
+#endif
+
 // Forward declarations
 static void *ior_threads_pool_worker_thread_func(void *arg);
 static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_position);
