@@ -38,9 +38,8 @@ static void test_wait_cqe_timeout(void **state)
 		.tv_nsec = 100000000 // 100ms
 	};
 
-	// Submit a timeout operation that will complete after the wait timeout
-	ior_timespec long_timeout = { .tv_sec = 5, // 5 seconds - much longer than wait timeout
-		.tv_nsec = 0 };
+	// Submit a timeout operation that will complete after (takes 2s) the wait timeout
+	ior_timespec long_timeout = { .tv_sec = 2, .tv_nsec = 0 };
 
 	ior_sqe *sqe = ior_get_sqe(ts->ctx);
 	assert_non_null(sqe);
