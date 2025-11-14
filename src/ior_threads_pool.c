@@ -317,21 +317,20 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 	while (continue_chain) {
 		continue_chain = 0;
 
-		// Pick next SQE in chain
-		uint64_t next_position;
-		ior_sqe *sqe = (current_position == start_position) ? NULL : // First SQE already picked
-				ior_threads_ring_pick_sqe(&ctx->sq_ring, &next_position);
-
-		IOR_LOG_TRACE("processing: sqe=%p", (void *) sqe);
+		ior_sqe *sqe;
+		uint64_t next_position = 0;  // Initialize to avoid garbage
 
 		// For first iteration, we already have the SQE from worker
 		if (current_position == start_position) {
 			// Need to peek at the already-picked SQE
-			// Since we have the position, calculate index
 			uint32_t index = current_position & ctx->sq_ring.mask;
 			ior_sqe *sqes = (ior_sqe *) ctx->sq_ring.entries;
 			sqe = &sqes[index];
 			IOR_LOG_TRACE("processing first: index=%u", index);
+		} else {
+			// Pick next SQE in chain
+			sqe = ior_threads_ring_pick_sqe(&ctx->sq_ring, &next_position);
+			IOR_LOG_TRACE("picked next: position=%lu", next_position);
 		}
 
 		if (!sqe) {
@@ -367,6 +366,10 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 
 		// If this SQE had IO_LINK flag and succeeded, continue to next
 		if (has_link && cqe.threads.res >= 0) {
+			// For first iteration, next_position needs to be calculated
+			if (current_position == start_position) {
+				next_position = start_position + 1;
+			}
 			continue_chain = 1;
 			current_position = next_position;
 			IOR_LOG_TRACE("link continue: next_position=%lu", next_position);
