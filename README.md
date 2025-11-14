@@ -19,6 +19,8 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Write operations  
 - Timer/timeout operations
 - Splice operations (Linux)
+- Operation chaining with `IOR_SQE_IO_LINK`
+- Ordering with `IOR_SQE_IO_DRAIN`
 - Thread pool emulation backend
 - Linux io_uring backend (with liburing)
 - eventfd-based notification (Linux/FreeBSD 13+)
@@ -95,8 +97,8 @@ int main() {
         return 1;
     }
     
-    ior_prep_read(sqe, fd, buffer, sizeof(buffer), 0);
-    ior_sqe_set_data(sqe, NULL);
+    ior_prep_read(ctx, sqe, fd, buffer, sizeof(buffer), 0);
+    ior_sqe_set_data(ctx, sqe, NULL);
     
     // Submit and wait
     if (ior_submit(ctx) < 0) {
@@ -115,10 +117,11 @@ int main() {
         return 1;
     }
     
-    if (cqe->res < 0) {
-        fprintf(stderr, "Read error: %d\n", cqe->res);
+    int32_t res = ior_cqe_get_res(ctx, cqe);
+    if (res < 0) {
+        fprintf(stderr, "Read error: %d\n", res);
     } else {
-        printf("Read %d bytes\n", cqe->res);
+        printf("Read %d bytes\n", res);
     }
     
     ior_cqe_seen(ctx, cqe);
@@ -128,6 +131,33 @@ int main() {
     ior_queue_exit(ctx);
     
     return 0;
+}
+```
+
+### Operation Chaining Example
+
+Chain operations so they execute in order:
+
+```c
+// Write followed by read using IO_LINK
+ior_sqe *write_sqe = ior_get_sqe(ctx);
+ior_prep_write(ctx, write_sqe, fd, data, len, 0);
+ior_sqe_set_data(ctx, write_sqe, (void*)1);
+ior_sqe_set_flags(ctx, write_sqe, IOR_SQE_IO_LINK);  // Link to next
+
+ior_sqe *read_sqe = ior_get_sqe(ctx);
+ior_prep_read(ctx, read_sqe, fd, buffer, len, 0);
+ior_sqe_set_data(ctx, read_sqe, (void*)2);
+
+// Submit both - read only executes if write succeeds
+ior_submit_and_wait(ctx, 2);
+
+// Process completions in order
+for (int i = 0; i < 2; i++) {
+    ior_cqe *cqe;
+    ior_wait_cqe(ctx, &cqe);
+    // ... process ...
+    ior_cqe_seen(ctx, cqe);
 }
 ```
 
@@ -144,35 +174,113 @@ gcc example.c -I/usr/local/include -L/usr/local/lib -lior -lpthread -o example
 
 ### Queue Management
 ```c
+// Initialize with default parameters
 int ior_queue_init(unsigned entries, ior_ctx **ctx_out);
+
+// Initialize with custom parameters
 int ior_queue_init_params(unsigned entries, ior_ctx **ctx_out, ior_params *params);
+
+// Cleanup and destroy queue
 void ior_queue_exit(ior_ctx *ctx);
 ```
 
 ### Submission
 ```c
+// Get a submission queue entry
 ior_sqe *ior_get_sqe(ior_ctx *ctx);
+
+// Submit all pending operations
 int ior_submit(ior_ctx *ctx);
+
+// Submit and wait for at least wait_nr completions
 int ior_submit_and_wait(ior_ctx *ctx, unsigned wait_nr);
 ```
 
 ### Completion
 ```c
+// Check for completion without blocking
 int ior_peek_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
+
+// Wait for a completion (blocks)
 int ior_wait_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
+
+// Wait with timeout
 int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, ior_timespec *timeout);
+
+// Mark completion as consumed (advances completion queue)
 void ior_cqe_seen(ior_ctx *ctx, ior_cqe *cqe);
+
+// Batch completion processing
+unsigned ior_peek_batch_cqe(ior_ctx *ctx, ior_cqe **cqes, unsigned max);
+void ior_cq_advance(ior_ctx *ctx, unsigned nr);
 ```
 
-### Helper Functions
+### Operation Preparation
+
+All prep functions require the `ctx` parameter:
+
 ```c
-void ior_prep_read(ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset);
-void ior_prep_write(ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset);
-void ior_prep_timeout(ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
-void ior_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out, uint64_t off_out, unsigned nbytes, unsigned splice_flags);
-void ior_sqe_set_data(ior_sqe *sqe, void *data);
-void *ior_cqe_get_data(ior_cqe *cqe);
+// No-op operation
+void ior_prep_nop(ior_ctx *ctx, ior_sqe *sqe);
+
+// Read operation
+void ior_prep_read(ior_ctx *ctx, ior_sqe *sqe, int fd, void *buf, 
+                   unsigned nbytes, uint64_t offset);
+
+// Write operation
+void ior_prep_write(ior_ctx *ctx, ior_sqe *sqe, int fd, const void *buf,
+                    unsigned nbytes, uint64_t offset);
+
+// Timeout operation
+void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
+                      unsigned count, unsigned flags);
+
+// Splice operation (Linux only)
+void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,
+                     int fd_out, uint64_t off_out, unsigned nbytes, unsigned flags);
 ```
+
+### SQE/CQE Accessors
+
+```c
+// Set user data (for identifying completions)
+void ior_sqe_set_data(ior_ctx *ctx, ior_sqe *sqe, void *data);
+
+// Set operation flags (IO_LINK, IO_DRAIN, etc.)
+void ior_sqe_set_flags(ior_ctx *ctx, ior_sqe *sqe, uint8_t flags);
+
+// Get user data from completion
+void *ior_cqe_get_data(ior_ctx *ctx, ior_cqe *cqe);
+
+// Get operation result (bytes transferred or negative errno)
+int32_t ior_cqe_get_res(ior_ctx *ctx, ior_cqe *cqe);
+
+// Get completion flags
+uint32_t ior_cqe_get_flags(ior_ctx *ctx, ior_cqe *cqe);
+```
+
+### Backend Information
+```c
+// Get backend type
+ior_backend_type ior_get_backend_type(ior_ctx *ctx);
+
+// Get backend name as string
+const char *ior_get_backend_name(ior_ctx *ctx);
+
+// Get supported features
+uint32_t ior_get_features(ior_ctx *ctx);
+```
+
+## API Design
+
+### Opaque Types
+
+IOR uses opaque types for `ior_ctx`, `ior_sqe`, and `ior_cqe`. This allows:
+- Backend-specific implementations without exposing internals
+- Binary compatibility across versions
+- Clean separation between interface and implementation
+
+All operations require passing the `ctx` parameter to route to the correct backend.
 
 ## Architecture
 
@@ -188,13 +296,16 @@ IOR automatically selects the best available backend:
 
 The thread pool backend uses:
 - Lock-free ring buffers for submission and completion queues
+- Out-of-order completion support for maximum parallelism
+- Operation chaining with `IOR_SQE_IO_LINK` flag
+- Ordering guarantees with `IOR_SQE_IO_DRAIN` flag
 - eventfd (Linux/FreeBSD 13+) or pipe-based notification
-- Configurable number of worker threads (defaults to CPU count)
+- Dynamic worker thread scaling
 - Efficient work distribution and completion posting
 
 ## Performance Considerations
 
 - **Linux with io_uring**: Near-zero overhead wrapper, performance matches native io_uring
-- **Thread backend**: Optimized for throughput with batching support
-- **Queue sizing**: Larger queues reduce contention but use more memory
-- **Batch operations**: Use `ior_peek_batch_cqe()` for better efficiency when processing many completions
+- **Thread backend**: Optimized for throughput with batching support and lock-free data structures
+- **Batch operations**: Use `ior_peek_batch_cqe()` and `ior_cq_advance()` for better efficiency when processing many completions
+- **Operation chaining**: Use `IOR_SQE_IO_LINK` to chain operations without intermediate submissions
