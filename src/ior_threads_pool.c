@@ -401,8 +401,8 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
 			ssize_t ret = pread(sqe->threads.fd, (void *) (uintptr_t) sqe->threads.addr,
 					sqe->threads.len, sqe->threads.off);
-			IOR_LOG_TRACE("read end: res=%ld", ret);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
+			IOR_LOG_TRACE("read end: res=%d", cqe->threads.res);
 			break;
 		}
 
@@ -411,8 +411,8 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
 			ssize_t ret = pwrite(sqe->threads.fd, (const void *) (uintptr_t) sqe->threads.addr,
 					sqe->threads.len, sqe->threads.off);
-			IOR_LOG_TRACE("write end: res=%ld", ret);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
+			IOR_LOG_TRACE("write end: res=%d", cqe->threads.res);
 			break;
 		}
 
@@ -428,27 +428,33 @@ static void ior_threads_pool_process_single_sqe(
 				IOR_LOG_TRACE("timer end: res=%d", -ETIME);
 				cqe->threads.res = -ETIME;
 			} else {
-				IOR_LOG_TRACE("timer failed: no addr");
+				IOR_LOG_TRACE("timer failed: res=%d", -EINVAL);
 				cqe->threads.res = -EINVAL;
 			}
 			break;
 		}
 
 		case IOR_OP_SPLICE: {
-#ifdef IOR_HAVE_SPLICE
-			ssize_t ret = splice(sqe->threads.splice_fd_in,
-					(loff_t *) (sqe->threads.addr ? &sqe->threads.addr : NULL), sqe->threads.fd,
-					(loff_t *) (sqe->threads.off ? &sqe->threads.off : NULL), sqe->threads.len,
+			int fd_in = sqe->threads.splice_fd_in, fd_out = sqe->threads.fd;
+			loff_t *off_in = sqe->threads.splice_off_in == IOR_SPLICE_OFF_NONE
+					? NULL
+					: (loff_t *) sqe->threads.splice_off_in;
+			loff_t *off_out
+					= sqe->threads.off == IOR_SPLICE_OFF_NONE ? NULL : (loff_t *) sqe->threads.off;
+			IOR_LOG_TRACE("splice start: fd_in=%d, off_in=%lu, fd_out=%d, off_out=%lu, size=%u, "
+						  "flags=%u",
+					fd_in, sqe->threads.splice_off_in, fd_out, sqe->threads.off, sqe->threads.len,
 					sqe->threads.splice_flags);
-			cqe->threads.res = (ret < 0) ? -errno : ret;
+#ifdef IOR_HAVE_SPLICE
+			ssize_t ret = splice(
+					fd_in, off_in, fd_out, off_out, sqe->threads.len, sqe->threads.splice_flags);
 #else
 			// Emulate splice using read/write loop
-			ssize_t ret = ior_threads_pool_emulate_splice(sqe->threads.splice_fd_in,
-					(loff_t *) (sqe->threads.addr ? &sqe->threads.addr : NULL), sqe->threads.fd,
-					(loff_t *) (sqe->threads.off ? &sqe->threads.off : NULL), sqe->threads.len,
-					sqe->threads.splice_flags);
-			cqe->threads.res = (ret < 0) ? -errno : ret;
+			ssize_t ret = ior_threads_pool_emulate_splice(
+					fd_in, off_in, fd_out, off_out, sqe->threads.len, sqe->threads.splice_flags);
 #endif
+			cqe->threads.res = (ret < 0) ? -errno : ret;
+			IOR_LOG_TRACE("splice end: res=%d", cqe->threads.res);
 			break;
 		}
 
