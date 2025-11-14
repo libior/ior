@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  linux-uring:
+    name: Linux io_uring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev libcmocka-dev
+      
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      
+      - name: Print backend info
+        run: |
+          cd build/tests
+          ./test_basic || true
+
+  linux-threads:
+    name: Linux threads backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcmocka-dev
+      
+      - name: Configure (force threads)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_FORCE_THREADS=ON
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  linux-uring-asan:
+    name: Linux io_uring + AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev libcmocka-dev
+      
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_ENABLE_ASAN=ON
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+
+  linux-threads-asan:
+    name: Linux threads + AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcmocka-dev
+      
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_FORCE_THREADS=ON -DIOR_ENABLE_ASAN=ON
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+
+  linux-threads-tsan:
+    name: Linux threads + ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcmocka-dev
+      
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_FORCE_THREADS=ON -DIOR_ENABLE_TSAN=ON
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:second_deadlock_stack=1
+
+  macos:
+    name: macOS (threads only)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: brew install cmocka
+      
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  macos-asan:
+    name: macOS + AddressSanitizer
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: brew install cmocka
+      
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_ENABLE_ASAN=ON
+      
+      - name: Build
+        run: cmake --build build
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
