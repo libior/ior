@@ -425,8 +425,8 @@ static void ior_threads_pool_process_single_sqe(
 				};
 				IOR_LOG_TRACE("timer start: sec=%ld, nsec=%lld", ts->tv_sec, ts->tv_nsec);
 				nanosleep(&sts, NULL);
-				IOR_LOG_TRACE("timer end: res=0");
-				cqe->threads.res = 0;
+				IOR_LOG_TRACE("timer end: res=%d", -ETIME);
+				cqe->threads.res = -ETIME;
 			} else {
 				IOR_LOG_TRACE("timer failed: no addr");
 				cqe->threads.res = -EINVAL;
