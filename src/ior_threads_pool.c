@@ -318,7 +318,7 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 		continue_chain = 0;
 
 		ior_sqe *sqe;
-		uint64_t next_position = 0;  // Initialize to avoid garbage
+		uint64_t next_position = 0; // Initialize to avoid garbage
 
 		// For first iteration, we already have the SQE from worker
 		if (current_position == start_position) {
