@@ -42,20 +42,20 @@ void ior_log_internal(int level, const char *level_str, const char *func, int li
 		...) __attribute__((format(printf, 5, 6)));
 
 /* Logging macros */
-#define IOR_LOG_TRACE(fmt, ...) \
-	ior_log_internal(IOR_LOG_LEVEL_TRACE, "TRACE", __func__, __LINE__, fmt, ##__VA_ARGS__)
+#define IOR_LOG_TRACE(...) \
+	ior_log_internal(IOR_LOG_LEVEL_TRACE, "TRACE", __func__, __LINE__, __VA_ARGS__)
 
-#define IOR_LOG_DEBUG(fmt, ...) \
-	ior_log_internal(IOR_LOG_LEVEL_DEBUG, "DEBUG", __func__, __LINE__, fmt, ##__VA_ARGS__)
+#define IOR_LOG_DEBUG(...) \
+	ior_log_internal(IOR_LOG_LEVEL_DEBUG, "DEBUG", __func__, __LINE__, __VA_ARGS__)
 
-#define IOR_LOG_INFO(fmt, ...) \
-	ior_log_internal(IOR_LOG_LEVEL_INFO, "INFO", __func__, __LINE__, fmt, ##__VA_ARGS__)
+#define IOR_LOG_INFO(...) \
+	ior_log_internal(IOR_LOG_LEVEL_INFO, "INFO", __func__, __LINE__, __VA_ARGS__)
 
-#define IOR_LOG_WARN(fmt, ...) \
-	ior_log_internal(IOR_LOG_LEVEL_WARN, "WARN", __func__, __LINE__, fmt, ##__VA_ARGS__)
+#define IOR_LOG_WARN(...) \
+	ior_log_internal(IOR_LOG_LEVEL_WARN, "WARN", __func__, __LINE__, __VA_ARGS__)
 
-#define IOR_LOG_ERROR(fmt, ...) \
-	ior_log_internal(IOR_LOG_LEVEL_ERROR, "ERROR", __func__, __LINE__, fmt, ##__VA_ARGS__)
+#define IOR_LOG_ERROR(...) \
+	ior_log_internal(IOR_LOG_LEVEL_ERROR, "ERROR", __func__, __LINE__, __VA_ARGS__)
 
 #else /* !IOR_HAVE_LOG */
 
@@ -68,19 +68,19 @@ static inline void ior_log_destroy(void)
 {
 }
 
-#define IOR_LOG_TRACE(fmt, ...) \
+#define IOR_LOG_TRACE(...) \
 	do { \
 	} while (0)
-#define IOR_LOG_DEBUG(fmt, ...) \
+#define IOR_LOG_DEBUG(...) \
 	do { \
 	} while (0)
-#define IOR_LOG_INFO(fmt, ...) \
+#define IOR_LOG_INFO(...) \
 	do { \
 	} while (0)
-#define IOR_LOG_WARN(fmt, ...) \
+#define IOR_LOG_WARN(...) \
 	do { \
 	} while (0)
-#define IOR_LOG_ERROR(fmt, ...) \
+#define IOR_LOG_ERROR(...) \
 	do { \
 	} while (0)
 
