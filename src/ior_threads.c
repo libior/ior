@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "config.h"
+
+#ifdef IOR_HAVE_THREADS
+
 #include "ior_backend.h"
 #include "ior_threads.h"
 #include <stdlib.h>
@@ -332,11 +335,11 @@ static void ior_threads_backend_prep_nop(ior_sqe *sqe)
 {
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->threads.opcode = IOR_OP_NOP;
-	sqe->threads.fd = -1;
+	sqe->threads.fd = IOR_INVALID_FD;
 }
 
 static void ior_threads_backend_prep_read(
-		ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset)
+		ior_sqe *sqe, ior_fd_t fd, void *buf, unsigned nbytes, uint64_t offset)
 {
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->threads.opcode = IOR_OP_READ;
@@ -347,7 +350,7 @@ static void ior_threads_backend_prep_read(
 }
 
 static void ior_threads_backend_prep_write(
-		ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset)
+		ior_sqe *sqe, ior_fd_t fd, const void *buf, unsigned nbytes, uint64_t offset)
 {
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->threads.opcode = IOR_OP_WRITE;
@@ -357,8 +360,8 @@ static void ior_threads_backend_prep_write(
 	sqe->threads.off = offset;
 }
 
-static void ior_threads_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
-		uint64_t off_out, unsigned nbytes, unsigned flags)
+static void ior_threads_backend_prep_splice(ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in,
+		ior_fd_t fd_out, uint64_t off_out, unsigned nbytes, unsigned flags)
 {
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->threads.opcode = IOR_OP_SPLICE;
@@ -375,7 +378,7 @@ static void ior_threads_backend_prep_timeout(
 {
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->threads.opcode = IOR_OP_TIMER;
-	sqe->threads.fd = -1;
+	sqe->threads.fd = IOR_INVALID_FD;
 	sqe->threads.addr = (uint64_t) (uintptr_t) ts;
 	sqe->threads.len = 1;
 	sqe->threads.off = count;
@@ -452,3 +455,5 @@ const ior_backend_ops ior_threads_ops = {
 	.backend_name = ior_threads_backend_name,
 	.get_features = ior_threads_backend_get_features,
 };
+
+#endif /* IOR_HAVE_THREADS */

@@ -196,7 +196,7 @@ static void ior_uring_backend_cq_advance(void *backend_ctx, unsigned nr)
 	io_uring_cq_advance(&ctx->ring, nr);
 }
 
-/* SQE preparation helpers - use liburing's helpers directly */
+/* SQE preparation helpers - use liburing's helpers directly, cast ior_fd_t to int */
 
 static void ior_uring_backend_prep_nop(ior_sqe *sqe)
 {
@@ -205,24 +205,27 @@ static void ior_uring_backend_prep_nop(ior_sqe *sqe)
 }
 
 static void ior_uring_backend_prep_read(
-		ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset)
+		ior_sqe *sqe, ior_fd_t fd, void *buf, unsigned nbytes, uint64_t offset)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
-	io_uring_prep_read(s, fd, buf, nbytes, offset);
+	// io_uring uses int fd - cast from ior_fd_t (which is int on Linux)
+	io_uring_prep_read(s, (int) fd, buf, nbytes, offset);
 }
 
 static void ior_uring_backend_prep_write(
-		ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset)
+		ior_sqe *sqe, ior_fd_t fd, const void *buf, unsigned nbytes, uint64_t offset)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
-	io_uring_prep_write(s, fd, buf, nbytes, offset);
+	// io_uring uses int fd - cast from ior_fd_t (which is int on Linux)
+	io_uring_prep_write(s, (int) fd, buf, nbytes, offset);
 }
 
-static void ior_uring_backend_prep_splice(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
-		uint64_t off_out, unsigned nbytes, unsigned flags)
+static void ior_uring_backend_prep_splice(ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in,
+		ior_fd_t fd_out, uint64_t off_out, unsigned nbytes, unsigned flags)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
-	io_uring_prep_splice(s, fd_in, off_in, fd_out, off_out, nbytes, flags);
+	// io_uring uses int fd - cast from ior_fd_t (which is int on Linux)
+	io_uring_prep_splice(s, (int) fd_in, off_in, (int) fd_out, off_out, nbytes, flags);
 }
 
 static void ior_uring_backend_prep_timeout(

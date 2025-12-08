@@ -10,6 +10,16 @@
 extern "C" {
 #endif
 
+/* Platform-specific file descriptor type */
+#ifdef _WIN32
+#include <windows.h>
+typedef HANDLE ior_fd_t;
+#define IOR_INVALID_FD INVALID_HANDLE_VALUE
+#else
+typedef int ior_fd_t;
+#define IOR_INVALID_FD (-1)
+#endif
+
 /**
  * Platform-independent timespec for async I/O operations
  *
@@ -103,10 +113,11 @@ void ior_cq_advance(ior_ctx *ctx, unsigned nr);
 
 /* Helper functions - work on opaque types via callbacks */
 void ior_prep_nop(ior_ctx *ctx, ior_sqe *sqe);
-void ior_prep_read(ior_ctx *ctx, ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset);
+void ior_prep_read(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, void *buf, unsigned nbytes, uint64_t offset);
 void ior_prep_write(
-		ior_ctx *ctx, ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset);
-void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const void *buf, unsigned nbytes, uint64_t offset);
+void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in, ior_fd_t fd_out,
 		uint64_t off_out, unsigned nbytes, unsigned flags);
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
 

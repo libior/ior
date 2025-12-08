@@ -28,7 +28,7 @@ typedef struct ior_sqe_threads {
 	uint8_t opcode;
 	uint8_t flags;
 	uint16_t ioprio;
-	int32_t fd;
+	ior_fd_t fd;
 	uint64_t off;
 	uint64_t addr;
 	uint32_t len;
@@ -39,7 +39,7 @@ typedef struct ior_sqe_threads {
 	};
 	uint64_t user_data;
 	union {
-		int32_t splice_fd_in;
+		ior_fd_t splice_fd_in;
 		uint32_t file_index;
 	};
 	uint64_t splice_off_in;
@@ -59,7 +59,7 @@ typedef struct ior_sqe_iocp {
 	uint8_t opcode;
 	uint8_t flags;
 	uint16_t ioprio;
-	int32_t fd;
+	ior_fd_t fd;
 	uint64_t off;
 	uint64_t addr;
 	uint32_t len;
@@ -125,10 +125,11 @@ typedef struct ior_backend_ops {
 
 	/* SQE preparation helpers */
 	void (*prep_nop)(ior_sqe *sqe);
-	void (*prep_read)(ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset);
-	void (*prep_write)(ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset);
-	void (*prep_splice)(ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out, uint64_t off_out,
-			unsigned nbytes, unsigned flags);
+	void (*prep_read)(ior_sqe *sqe, ior_fd_t fd, void *buf, unsigned nbytes, uint64_t offset);
+	void (*prep_write)(
+			ior_sqe *sqe, ior_fd_t fd, const void *buf, unsigned nbytes, uint64_t offset);
+	void (*prep_splice)(ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in, ior_fd_t fd_out,
+			uint64_t off_out, unsigned nbytes, unsigned flags);
 	void (*prep_timeout)(ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
 	void (*sqe_set_data)(ior_sqe *sqe, void *data);
 	void (*sqe_set_flags)(ior_sqe *sqe, uint8_t flags);
