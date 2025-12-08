@@ -11,6 +11,12 @@
 #include <windows.h>
 #include <assert.h>
 
+// ETIME is used for timer expiration (matches io_uring semantics)
+// On some platforms it may not be defined
+#ifndef ETIME
+#define ETIME 62 // Match Linux value
+#endif
+
 /*
  * Handle tracking for IOCP association
  * Windows requires each handle to be associated with exactly one IOCP
@@ -48,6 +54,11 @@ typedef struct ior_iocp_op {
 	ior_timespec *timeout_ts;
 	uint32_t timeout_flags;
 
+	// Timer bookkeeping (for IOR_OP_TIMER)
+	uint64_t timer_deadline_ns; // Absolute deadline in monotonic time
+	bool timer_armed; // True once enqueued into timer heap
+	bool timer_cancelled; // True if timer was cancelled (future use)
+
 	// Result tracking (filled by completion)
 	DWORD bytes_transferred;
 	DWORD error_code;
@@ -67,6 +78,19 @@ typedef struct ready_queue {
 	uint32_t count;
 	uint32_t size; // Allocated size
 } ready_queue;
+
+/* Timer manager - single thread managing all timers */
+typedef struct timer_mgr {
+	CRITICAL_SECTION lock;
+	CONDITION_VARIABLE cv;
+	HANDLE thread;
+	_Atomic uint32_t stop;
+
+	// Min-heap of ior_iocp_op* ordered by timer_deadline_ns
+	ior_iocp_op **heap;
+	uint32_t heap_len;
+	uint32_t heap_cap;
+} timer_mgr;
 
 /* IOCP backend context */
 typedef struct ior_ctx_iocp {
@@ -90,6 +114,9 @@ typedef struct ior_ctx_iocp {
 
 	// Ready queue for completed operations
 	ready_queue ready;
+
+	// Timer manager
+	timer_mgr timers;
 
 	// Handle association tracking
 	handle_set handles;
@@ -117,7 +144,7 @@ static int win_error_to_errno(DWORD err)
 		case ERROR_OUTOFMEMORY:
 			return -ENOMEM;
 		case ERROR_TIMEOUT:
-			return -ETIMEDOUT;
+			return -ETIME; // Timer expiration - matches io_uring/threads semantics
 		case ERROR_IO_PENDING:
 			return 0; // Not an error - async in progress
 		case ERROR_HANDLE_EOF:
@@ -311,6 +338,9 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->offset = 0;
 	op->timeout_ts = NULL;
 	op->timeout_flags = 0;
+	op->timer_deadline_ns = 0;
+	op->timer_armed = false;
+	op->timer_cancelled = false;
 	op->bytes_transferred = 0;
 	op->error_code = 0;
 	op->is_synthetic = false;
@@ -502,6 +532,244 @@ static ior_iocp_op *cqe_to_op(ior_cqe *cqe)
 }
 
 /*
+ * Timer Support - QueryPerformanceCounter for monotonic time
+ */
+
+// Get current time in nanoseconds (monotonic)
+static uint64_t qpc_now_ns(void)
+{
+	static LARGE_INTEGER freq = { 0 };
+	if (freq.QuadPart == 0) {
+		QueryPerformanceFrequency(&freq);
+	}
+
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+
+	// Convert to nanoseconds: (counter * 1e9) / freq
+	return (uint64_t) ((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
+}
+
+// Convert timespec to absolute deadline
+static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts)
+{
+	uint64_t now = qpc_now_ns();
+	uint64_t delta_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	return now + delta_ns;
+}
+
+/*
+ * Timer Heap - Min-heap of ior_iocp_op* by timer_deadline_ns
+ */
+
+// Swap two heap entries
+static void timer_heap_swap(timer_mgr *tm, uint32_t i, uint32_t j)
+{
+	ior_iocp_op *tmp = tm->heap[i];
+	tm->heap[i] = tm->heap[j];
+	tm->heap[j] = tmp;
+}
+
+// Sift up (used after push)
+static void timer_heap_sift_up(timer_mgr *tm, uint32_t idx)
+{
+	while (idx > 0) {
+		uint32_t parent = (idx - 1) / 2;
+		if (tm->heap[idx]->timer_deadline_ns >= tm->heap[parent]->timer_deadline_ns) {
+			break;
+		}
+		timer_heap_swap(tm, idx, parent);
+		idx = parent;
+	}
+}
+
+// Sift down (used after pop)
+static void timer_heap_sift_down(timer_mgr *tm, uint32_t idx)
+{
+	uint32_t len = tm->heap_len;
+	while (1) {
+		uint32_t left = 2 * idx + 1;
+		uint32_t right = 2 * idx + 2;
+		uint32_t smallest = idx;
+
+		if (left < len
+				&& tm->heap[left]->timer_deadline_ns < tm->heap[smallest]->timer_deadline_ns) {
+			smallest = left;
+		}
+		if (right < len
+				&& tm->heap[right]->timer_deadline_ns < tm->heap[smallest]->timer_deadline_ns) {
+			smallest = right;
+		}
+
+		if (smallest == idx) {
+			break;
+		}
+
+		timer_heap_swap(tm, idx, smallest);
+		idx = smallest;
+	}
+}
+
+// Push timer onto heap
+static int timer_heap_push(timer_mgr *tm, ior_iocp_op *op)
+{
+	// Grow if needed
+	if (tm->heap_len >= tm->heap_cap) {
+		uint32_t new_cap = tm->heap_cap * 2;
+		if (new_cap < 16) {
+			new_cap = 16;
+		}
+
+		ior_iocp_op **new_heap = realloc(tm->heap, new_cap * sizeof(ior_iocp_op *));
+		if (!new_heap) {
+			return -ENOMEM;
+		}
+
+		tm->heap = new_heap;
+		tm->heap_cap = new_cap;
+	}
+
+	// Add to end and sift up
+	tm->heap[tm->heap_len] = op;
+	timer_heap_sift_up(tm, tm->heap_len);
+	tm->heap_len++;
+
+	return 0;
+}
+
+// Pop earliest timer from heap
+static ior_iocp_op *timer_heap_pop(timer_mgr *tm)
+{
+	if (tm->heap_len == 0) {
+		return NULL;
+	}
+
+	ior_iocp_op *op = tm->heap[0];
+
+	// Move last to root and sift down
+	tm->heap_len--;
+	if (tm->heap_len > 0) {
+		tm->heap[0] = tm->heap[tm->heap_len];
+		timer_heap_sift_down(tm, 0);
+	}
+
+	return op;
+}
+
+// Peek at earliest timer without removing
+static ior_iocp_op *timer_heap_peek(timer_mgr *tm)
+{
+	if (tm->heap_len == 0) {
+		return NULL;
+	}
+	return tm->heap[0];
+}
+
+/*
+ * Timer Thread
+ */
+
+static DWORD WINAPI timer_thread_main(LPVOID arg)
+{
+	ior_ctx_iocp *ctx = arg;
+	timer_mgr *tm = &ctx->timers;
+
+	EnterCriticalSection(&tm->lock);
+
+	while (!atomic_load(&tm->stop)) {
+		// Wait until we have at least one timer
+		while (tm->heap_len == 0 && !atomic_load(&tm->stop)) {
+			SleepConditionVariableCS(&tm->cv, &tm->lock, INFINITE);
+		}
+
+		if (atomic_load(&tm->stop)) {
+			break;
+		}
+
+		// Get earliest deadline
+		ior_iocp_op *op = timer_heap_peek(tm);
+		if (!op) {
+			continue; // Spurious wakeup
+		}
+
+		uint64_t now = qpc_now_ns();
+
+		if (op->timer_deadline_ns > now) {
+			// Compute wait time to deadline
+			uint64_t delta_ns = op->timer_deadline_ns - now;
+			DWORD wait_ms = (DWORD) (delta_ns / 1000000ULL);
+			if (wait_ms == 0) {
+				wait_ms = 1; // At least 1ms
+			}
+
+			// Wait until deadline OR new timer OR stop
+			SleepConditionVariableCS(&tm->cv, &tm->lock, wait_ms);
+			continue; // Re-check heap
+		}
+
+		// Deadline reached - pop and complete
+		op = timer_heap_pop(tm);
+		op->timer_armed = false;
+
+		// Mark as timeout synthetic completion
+		op->is_synthetic = true;
+		op->error_code = ERROR_TIMEOUT;
+		op->bytes_transferred = 0;
+
+		// Post to IOCP (release lock during syscall)
+		LeaveCriticalSection(&tm->lock);
+		PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped);
+		EnterCriticalSection(&tm->lock);
+
+		// active_count was incremented when timer was armed
+		// It will be decremented when completion is dequeued
+	}
+
+	LeaveCriticalSection(&tm->lock);
+	return 0;
+}
+
+// Arm a timer (called from submit for IOR_OP_TIMER)
+static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (!op->timeout_ts) {
+		return -EINVAL;
+	}
+
+	if (op->timeout_ts->tv_sec < 0 || op->timeout_ts->tv_nsec < 0
+			|| op->timeout_ts->tv_nsec >= 1000000000L) {
+		return -EINVAL;
+	}
+
+	uint64_t deadline = qpc_deadline_from_timespec(op->timeout_ts);
+
+	timer_mgr *tm = &ctx->timers;
+
+	EnterCriticalSection(&tm->lock);
+
+	op->timer_deadline_ns = deadline;
+	op->timer_armed = true;
+	op->timer_cancelled = false;
+
+	int ret = timer_heap_push(tm, op);
+	if (ret == 0) {
+		// Successfully armed - count as active
+		atomic_fetch_add(&ctx->active_count, 1);
+		// Wake timer thread to check new deadline
+		WakeConditionVariable(&tm->cv);
+	}
+
+	LeaveCriticalSection(&tm->lock);
+
+	if (ret < 0) {
+		// Failed to arm (OOM) - complete immediately with error
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
+	return 0;
+}
+
+/*
  * Backend Operations
  */
 
@@ -571,6 +839,37 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return ret;
 	}
 
+	// Initialize timer manager
+	InitializeCriticalSection(&ctx->timers.lock);
+	InitializeConditionVariable(&ctx->timers.cv);
+	ctx->timers.heap_cap = cq_entries > 64 ? 64 : cq_entries; // Start smaller, grows as needed
+	ctx->timers.heap = calloc(ctx->timers.heap_cap, sizeof(ior_iocp_op *));
+	if (!ctx->timers.heap) {
+		free(ctx->sq_array);
+		free(ctx->op_pool);
+		ready_queue_destroy(&ctx->ready);
+		handle_set_destroy(&ctx->handles);
+		CloseHandle(ctx->iocp_handle);
+		free(ctx);
+		return -ENOMEM;
+	}
+	ctx->timers.heap_len = 0;
+	atomic_store(&ctx->timers.stop, 0);
+
+	// Start timer thread
+	ctx->timers.thread = CreateThread(NULL, 0, timer_thread_main, ctx, 0, NULL);
+	if (!ctx->timers.thread) {
+		free(ctx->timers.heap);
+		DeleteCriticalSection(&ctx->timers.lock);
+		free(ctx->sq_array);
+		free(ctx->op_pool);
+		ready_queue_destroy(&ctx->ready);
+		handle_set_destroy(&ctx->handles);
+		CloseHandle(ctx->iocp_handle);
+		free(ctx);
+		return -ENOMEM;
+	}
+
 	// Set features (no splice on Windows)
 	ctx->features = IOR_FEAT_NATIVE_ASYNC;
 	params->features = ctx->features;
@@ -586,6 +885,22 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	}
 
 	ior_ctx_iocp *ctx = backend_ctx;
+
+	// Stop timer thread first
+	atomic_store(&ctx->timers.stop, 1);
+	EnterCriticalSection(&ctx->timers.lock);
+	WakeConditionVariable(&ctx->timers.cv);
+	LeaveCriticalSection(&ctx->timers.lock);
+
+	// Wait for timer thread to exit
+	WaitForSingleObject(ctx->timers.thread, INFINITE);
+	CloseHandle(ctx->timers.thread);
+
+	// Cleanup timer resources
+	DeleteCriticalSection(&ctx->timers.lock);
+	if (ctx->timers.heap) {
+		free(ctx->timers.heap);
+	}
 
 	// TODO: Better cleanup - cancel pending operations with CancelIoEx
 	// For now, busy-wait (not ideal but simple)
@@ -673,7 +988,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 				break;
 
 			case IOR_OP_TIMER:
-				ret = post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+				ret = arm_timer(ctx, op);
 				break;
 
 			default:
@@ -915,7 +1230,7 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 		// This violates the consumption contract
 		IOR_LOG_ERROR("cqe_seen called out of order - expected %p, got %p", (void *) head_op,
 				(void *) op);
-#ifdef NDEBUG
+#ifndef NDEBUG
 		abort(); // Fail fast in debug builds
 #endif
 		return; // Don't corrupt queue in release builds
