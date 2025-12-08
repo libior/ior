@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <windows.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 // ETIME is used for timer expiration (matches io_uring semantics)
 // On some platforms it may not be defined
@@ -100,9 +101,12 @@ typedef struct ior_ctx_iocp {
 	ior_iocp_op *op_pool;
 	uint32_t pool_size;
 
-	// Free list
+	// Free list (protected by pool_lock because timer thread may return ops on PQCS
+	// failure/teardown)
+	CRITICAL_SECTION pool_lock;
 	ior_iocp_op *free_list_head;
 	uint32_t free_count;
+
 	_Atomic uint32_t active_count; // Operations in IOCP (not yet in ready queue)
 
 	// Submission queue (software ring)
@@ -318,13 +322,18 @@ static int init_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 // Allocate op from free list
 static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 {
+	EnterCriticalSection(&ctx->pool_lock);
+
 	if (!ctx->free_list_head) {
+		LeaveCriticalSection(&ctx->pool_lock);
 		return NULL; // Pool exhausted
 	}
 
 	ior_iocp_op *op = ctx->free_list_head;
 	ctx->free_list_head = op->next_free;
 	ctx->free_count--;
+
+	LeaveCriticalSection(&ctx->pool_lock);
 
 	// Clear only the request fields and OVERLAPPED, preserve next_free
 	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
@@ -356,9 +365,13 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return;
 	}
 
+	EnterCriticalSection(&ctx->pool_lock);
+
 	op->next_free = ctx->free_list_head;
 	ctx->free_list_head = op;
 	ctx->free_count++;
+
+	LeaveCriticalSection(&ctx->pool_lock);
 }
 
 // Initialize submission queue
@@ -402,6 +415,9 @@ static int post_synthetic_completion(
 	op->bytes_transferred = bytes_transferred;
 	op->is_synthetic = true;
 
+	// Ensure the op fields are visible before we publish it via IOCP.
+	MemoryBarrier();
+
 	// Post to IOCP so it will be dequeued normally
 	BOOL result
 			= PostQueuedCompletionStatus(ctx->iocp_handle, bytes_transferred, 0, &op->overlapped);
@@ -443,7 +459,7 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 	}
 
 	// Association succeeded - insert into set
-	bool inserted = handle_set_insert_locked(&ctx->handles, h);
+	(void) handle_set_insert_locked(&ctx->handles, h);
 	LeaveCriticalSection(&ctx->handles.lock);
 
 	// Insertion failure is non-fatal (we'll try to associate again next time)
@@ -535,7 +551,7 @@ static ior_iocp_op *cqe_to_op(ior_cqe *cqe)
  * Timer Support - QueryPerformanceCounter for monotonic time
  */
 
-// Get current time in nanoseconds (monotonic)
+// Get current time in nanoseconds (monotonic), overflow-safe conversion
 static uint64_t qpc_now_ns(void)
 {
 	static LARGE_INTEGER freq = { 0 };
@@ -546,11 +562,16 @@ static uint64_t qpc_now_ns(void)
 	LARGE_INTEGER counter;
 	QueryPerformanceCounter(&counter);
 
-	// Convert to nanoseconds: (counter * 1e9) / freq
-	return (uint64_t) ((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
+	uint64_t c = (uint64_t) counter.QuadPart;
+	uint64_t f = (uint64_t) freq.QuadPart;
+
+	uint64_t sec = c / f;
+	uint64_t rem = c % f;
+
+	return sec * 1000000000ULL + (rem * 1000000000ULL) / f;
 }
 
-// Convert timespec to absolute deadline
+// Convert timespec to absolute deadline (relative timeout)
 static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts)
 {
 	uint64_t now = qpc_now_ns();
@@ -562,7 +583,6 @@ static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts)
  * Timer Heap - Min-heap of ior_iocp_op* by timer_deadline_ns
  */
 
-// Swap two heap entries
 static void timer_heap_swap(timer_mgr *tm, uint32_t i, uint32_t j)
 {
 	ior_iocp_op *tmp = tm->heap[i];
@@ -570,7 +590,6 @@ static void timer_heap_swap(timer_mgr *tm, uint32_t i, uint32_t j)
 	tm->heap[j] = tmp;
 }
 
-// Sift up (used after push)
 static void timer_heap_sift_up(timer_mgr *tm, uint32_t idx)
 {
 	while (idx > 0) {
@@ -583,7 +602,6 @@ static void timer_heap_sift_up(timer_mgr *tm, uint32_t idx)
 	}
 }
 
-// Sift down (used after pop)
 static void timer_heap_sift_down(timer_mgr *tm, uint32_t idx)
 {
 	uint32_t len = tm->heap_len;
@@ -610,12 +628,10 @@ static void timer_heap_sift_down(timer_mgr *tm, uint32_t idx)
 	}
 }
 
-// Push timer onto heap
 static int timer_heap_push(timer_mgr *tm, ior_iocp_op *op)
 {
-	// Grow if needed
 	if (tm->heap_len >= tm->heap_cap) {
-		uint32_t new_cap = tm->heap_cap * 2;
+		uint32_t new_cap = tm->heap_cap ? tm->heap_cap * 2 : 16;
 		if (new_cap < 16) {
 			new_cap = 16;
 		}
@@ -629,7 +645,6 @@ static int timer_heap_push(timer_mgr *tm, ior_iocp_op *op)
 		tm->heap_cap = new_cap;
 	}
 
-	// Add to end and sift up
 	tm->heap[tm->heap_len] = op;
 	timer_heap_sift_up(tm, tm->heap_len);
 	tm->heap_len++;
@@ -637,7 +652,6 @@ static int timer_heap_push(timer_mgr *tm, ior_iocp_op *op)
 	return 0;
 }
 
-// Pop earliest timer from heap
 static ior_iocp_op *timer_heap_pop(timer_mgr *tm)
 {
 	if (tm->heap_len == 0) {
@@ -646,7 +660,6 @@ static ior_iocp_op *timer_heap_pop(timer_mgr *tm)
 
 	ior_iocp_op *op = tm->heap[0];
 
-	// Move last to root and sift down
 	tm->heap_len--;
 	if (tm->heap_len > 0) {
 		tm->heap[0] = tm->heap[tm->heap_len];
@@ -656,7 +669,6 @@ static ior_iocp_op *timer_heap_pop(timer_mgr *tm)
 	return op;
 }
 
-// Peek at earliest timer without removing
 static ior_iocp_op *timer_heap_peek(timer_mgr *tm)
 {
 	if (tm->heap_len == 0) {
@@ -671,13 +683,12 @@ static ior_iocp_op *timer_heap_peek(timer_mgr *tm)
 
 static DWORD WINAPI timer_thread_main(LPVOID arg)
 {
-	ior_ctx_iocp *ctx = arg;
+	ior_ctx_iocp *ctx = (ior_ctx_iocp *) arg;
 	timer_mgr *tm = &ctx->timers;
 
 	EnterCriticalSection(&tm->lock);
 
 	while (!atomic_load(&tm->stop)) {
-		// Wait until we have at least one timer
 		while (tm->heap_len == 0 && !atomic_load(&tm->stop)) {
 			SleepConditionVariableCS(&tm->cv, &tm->lock, INFINITE);
 		}
@@ -686,43 +697,43 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			break;
 		}
 
-		// Get earliest deadline
 		ior_iocp_op *op = timer_heap_peek(tm);
 		if (!op) {
-			continue; // Spurious wakeup
+			continue;
 		}
 
 		uint64_t now = qpc_now_ns();
 
 		if (op->timer_deadline_ns > now) {
-			// Compute wait time to deadline
 			uint64_t delta_ns = op->timer_deadline_ns - now;
 			DWORD wait_ms = (DWORD) (delta_ns / 1000000ULL);
 			if (wait_ms == 0) {
-				wait_ms = 1; // At least 1ms
+				wait_ms = 1;
 			}
 
-			// Wait until deadline OR new timer OR stop
 			SleepConditionVariableCS(&tm->cv, &tm->lock, wait_ms);
-			continue; // Re-check heap
+			continue;
 		}
 
 		// Deadline reached - pop and complete
 		op = timer_heap_pop(tm);
 		op->timer_armed = false;
 
-		// Mark as timeout synthetic completion
 		op->is_synthetic = true;
 		op->error_code = ERROR_TIMEOUT;
 		op->bytes_transferred = 0;
 
-		// Post to IOCP (release lock during syscall)
+		MemoryBarrier();
+
 		LeaveCriticalSection(&tm->lock);
-		PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped);
+		BOOL ok = PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped);
 		EnterCriticalSection(&tm->lock);
 
-		// active_count was incremented when timer was armed
-		// It will be decremented when completion is dequeued
+		if (!ok) {
+			// Couldn't publish completion -> undo "active" and return op to pool
+			atomic_fetch_sub(&ctx->active_count, 1);
+			free_op(ctx, op);
+		}
 	}
 
 	LeaveCriticalSection(&tm->lock);
@@ -730,15 +741,17 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 }
 
 // Arm a timer (called from submit for IOR_OP_TIMER)
+// This function MUST either publish a completion (synthetic) or ensure the op is still live.
+// It should not return a negative error without also finalizing the op.
 static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	if (!op->timeout_ts) {
-		return -EINVAL;
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
 	}
 
 	if (op->timeout_ts->tv_sec < 0 || op->timeout_ts->tv_nsec < 0
 			|| op->timeout_ts->tv_nsec >= 1000000000L) {
-		return -EINVAL;
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
 	}
 
 	uint64_t deadline = qpc_deadline_from_timespec(op->timeout_ts);
@@ -753,16 +766,13 @@ static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	int ret = timer_heap_push(tm, op);
 	if (ret == 0) {
-		// Successfully armed - count as active
 		atomic_fetch_add(&ctx->active_count, 1);
-		// Wake timer thread to check new deadline
 		WakeConditionVariable(&tm->cv);
 	}
 
 	LeaveCriticalSection(&tm->lock);
 
 	if (ret < 0) {
-		// Failed to arm (OOM) - complete immediately with error
 		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
 	}
 
@@ -786,28 +796,24 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 
 	ctx->flags = params->flags;
 
-	// Determine sizes
 	uint32_t sq_entries = params->sq_entries;
 	if (sq_entries < 32) {
 		sq_entries = 32;
 	}
 	sq_entries = round_up_pow2(sq_entries);
 
-	// CQ size (for ready queue)
 	uint32_t cq_entries = params->cq_entries;
 	if (cq_entries == 0) {
 		cq_entries = sq_entries * 2;
 	}
 	cq_entries = round_up_pow2(cq_entries);
 
-	// Create IOCP handle (0 = let system decide thread count)
 	ctx->iocp_handle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
 	if (ctx->iocp_handle == NULL) {
 		free(ctx);
 		return win_error_to_errno(GetLastError());
 	}
 
-	// Initialize ready queue (dynamically sized)
 	int ret = ready_queue_init(&ctx->ready, cq_entries);
 	if (ret < 0) {
 		CloseHandle(ctx->iocp_handle);
@@ -815,12 +821,13 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return ret;
 	}
 
-	// Initialize handle tracking
 	handle_set_init(&ctx->handles);
 
-	// Initialize operation pool
+	InitializeCriticalSection(&ctx->pool_lock);
+
 	ret = init_op_pool(ctx, sq_entries);
 	if (ret < 0) {
+		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
 		CloseHandle(ctx->iocp_handle);
@@ -828,10 +835,10 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return ret;
 	}
 
-	// Initialize submission queue
 	ret = init_sq_ring(ctx, sq_entries);
 	if (ret < 0) {
 		free(ctx->op_pool);
+		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
 		CloseHandle(ctx->iocp_handle);
@@ -842,27 +849,38 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	// Initialize timer manager
 	InitializeCriticalSection(&ctx->timers.lock);
 	InitializeConditionVariable(&ctx->timers.cv);
-	ctx->timers.heap_cap = cq_entries > 64 ? 64 : cq_entries; // Start smaller, grows as needed
+
+	ctx->timers.heap_cap = cq_entries;
+	if (ctx->timers.heap_cap > 64) {
+		ctx->timers.heap_cap = 64;
+	}
+	if (ctx->timers.heap_cap < 16) {
+		ctx->timers.heap_cap = 16;
+	}
+
 	ctx->timers.heap = calloc(ctx->timers.heap_cap, sizeof(ior_iocp_op *));
 	if (!ctx->timers.heap) {
+		DeleteCriticalSection(&ctx->timers.lock);
 		free(ctx->sq_array);
 		free(ctx->op_pool);
+		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
 		CloseHandle(ctx->iocp_handle);
 		free(ctx);
 		return -ENOMEM;
 	}
+
 	ctx->timers.heap_len = 0;
 	atomic_store(&ctx->timers.stop, 0);
 
-	// Start timer thread
 	ctx->timers.thread = CreateThread(NULL, 0, timer_thread_main, ctx, 0, NULL);
 	if (!ctx->timers.thread) {
 		free(ctx->timers.heap);
 		DeleteCriticalSection(&ctx->timers.lock);
 		free(ctx->sq_array);
 		free(ctx->op_pool);
+		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
 		CloseHandle(ctx->iocp_handle);
@@ -888,15 +906,31 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 
 	// Stop timer thread first
 	atomic_store(&ctx->timers.stop, 1);
+
 	EnterCriticalSection(&ctx->timers.lock);
 	WakeConditionVariable(&ctx->timers.cv);
 	LeaveCriticalSection(&ctx->timers.lock);
 
-	// Wait for timer thread to exit
 	WaitForSingleObject(ctx->timers.thread, INFINITE);
 	CloseHandle(ctx->timers.thread);
 
-	// Cleanup timer resources
+	// Drain any still-armed timers to keep active_count consistent and avoid destroy hangs.
+	EnterCriticalSection(&ctx->timers.lock);
+	while (ctx->timers.heap_len > 0) {
+		ior_iocp_op *op = timer_heap_pop(&ctx->timers);
+		if (!op) {
+			break;
+		}
+		op->timer_armed = false;
+
+		// This timer had incremented active_count when armed.
+		atomic_fetch_sub(&ctx->active_count, 1);
+
+		// Return op to pool (do NOT post completions during destroy).
+		free_op(ctx, op);
+	}
+	LeaveCriticalSection(&ctx->timers.lock);
+
 	DeleteCriticalSection(&ctx->timers.lock);
 	if (ctx->timers.heap) {
 		free(ctx->timers.heap);
@@ -908,9 +942,6 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		Sleep(1);
 	}
 
-	// Note: User must call cqe_seen/cq_advance before destroy
-	// Any ops still in ready queue will leak (same as other backends)
-
 	ready_queue_destroy(&ctx->ready);
 	handle_set_destroy(&ctx->handles);
 
@@ -921,6 +952,8 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	if (ctx->op_pool) {
 		free(ctx->op_pool);
 	}
+
+	DeleteCriticalSection(&ctx->pool_lock);
 
 	if (ctx->iocp_handle) {
 		CloseHandle(ctx->iocp_handle);
@@ -937,19 +970,16 @@ static ior_sqe *ior_iocp_backend_get_sqe(void *backend_ctx)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Allocate op from pool
 	ior_iocp_op *op = alloc_op(ctx);
 	if (!op) {
 		return NULL;
 	}
 
-	// Add to SQ ring
 	if (sq_enqueue(ctx, op) < 0) {
 		free_op(ctx, op);
 		return NULL;
 	}
 
-	// Return as ior_sqe (user will fill in via prep_* functions)
 	return (ior_sqe *) op;
 }
 
@@ -963,7 +993,6 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 	uint32_t submitted = 0;
 	int last_error = 0;
 
-	// Process all pending SQ entries
 	while (ctx->sq_head != ctx->sq_tail) {
 		ior_iocp_op *op = ctx->sq_array[ctx->sq_head];
 		ctx->sq_head = (ctx->sq_head + 1) & ctx->sq_mask;
@@ -997,14 +1026,12 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		}
 
 		if (ret < 0) {
-			// Post failed - record error but continue with other ops
 			last_error = ret;
 		} else {
 			submitted++;
 		}
 	}
 
-	// If any post failed, return error (or could return submitted count)
 	if (last_error < 0 && submitted == 0) {
 		return last_error;
 	}
@@ -1015,7 +1042,6 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 // Helper to dequeue one completion from IOCP into ready queue
 static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 {
-	// CRITICAL: Never dequeue if ready queue is full
 	if (ready_queue_full(&ctx->ready)) {
 		IOR_LOG_ERROR("Ready queue full - cannot dequeue");
 		return -EBUSY;
@@ -1028,42 +1054,28 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	BOOL ok = GetQueuedCompletionStatus(
 			ctx->iocp_handle, &bytes_transferred, &completion_key, &overlapped, timeout_ms);
 
-	// Capture error immediately if failed
 	DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
 
 	if (!ok) {
 		if (overlapped == NULL) {
-			// Timeout or error with no completion
-			// WAIT_TIMEOUT and ERROR_TIMEOUT are the same constant (258)
 			if (gle == WAIT_TIMEOUT || gle == ERROR_TIMEOUT) {
 				return (timeout_ms == 0) ? -EAGAIN : -ETIMEDOUT;
 			}
 			return win_error_to_errno(gle);
 		}
-		// Operation completed with error - process it (gle has the error)
 	}
 
 	if (overlapped == NULL) {
-		// Should not happen if ok == TRUE
 		return -EAGAIN;
 	}
 
-	// Extract our operation structure
 	ior_iocp_op *op = (ior_iocp_op *) overlapped;
 
-	// Set completion status directly from IOCP dequeue result
-	// This is the authoritative source for completion status
-	if (op->is_synthetic) {
-		// Synthetic completions already have error_code/bytes set
-		// Just use what was set by post_synthetic_completion
-	} else {
-		// Real I/O completion - use the IOCP dequeue status
+	if (!op->is_synthetic) {
 		op->error_code = gle;
 		op->bytes_transferred = ok ? bytes_transferred : 0;
 	}
 
-	// Decrement active count
-	// Debug check: ensure we don't underflow (would indicate a counting bug)
 #ifndef NDEBUG
 	uint32_t prev = atomic_fetch_sub(&ctx->active_count, 1);
 	assert(prev > 0 && "active_count underflow detected");
@@ -1071,13 +1083,10 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	atomic_fetch_sub(&ctx->active_count, 1);
 #endif
 
-	// Fill embedded CQE
 	op_to_cqe(op);
 
-	// Add to ready queue (we already checked it's not full)
 	int ret = ready_queue_push(&ctx->ready, op);
 	if (ret < 0) {
-		// This should never happen since we checked above
 		IOR_LOG_ERROR("Ready queue push failed unexpectedly");
 		return ret;
 	}
@@ -1093,7 +1102,6 @@ static int ior_iocp_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Submit pending operations
 	int submitted = ior_iocp_backend_submit(backend_ctx);
 	if (submitted < 0) {
 		return submitted;
@@ -1103,12 +1111,10 @@ static int ior_iocp_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 		return submitted;
 	}
 
-	// Clamp wait_nr to ready queue capacity to prevent deadlock
 	if (wait_nr > ctx->ready.size) {
 		wait_nr = ctx->ready.size;
 	}
 
-	// Ensure at least wait_nr completions are in ready queue
 	while (ctx->ready.count < wait_nr) {
 		int ret = dequeue_one_completion(ctx, INFINITE);
 		if (ret < 0) {
@@ -1127,20 +1133,17 @@ static int ior_iocp_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Check ready queue first
 	if (!ready_queue_empty(&ctx->ready)) {
 		ior_iocp_op *op = ready_queue_peek(&ctx->ready);
 		*cqe_out = &op->cqe;
 		return 0;
 	}
 
-	// Try to dequeue one from IOCP (non-blocking)
 	int ret = dequeue_one_completion(ctx, 0);
 	if (ret < 0) {
 		return ret;
 	}
 
-	// Now ready queue should have it
 	ior_iocp_op *op = ready_queue_peek(&ctx->ready);
 	*cqe_out = &op->cqe;
 	return 0;
@@ -1154,14 +1157,12 @@ static int ior_iocp_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Check ready queue first
 	if (!ready_queue_empty(&ctx->ready)) {
 		ior_iocp_op *op = ready_queue_peek(&ctx->ready);
 		*cqe_out = &op->cqe;
 		return 0;
 	}
 
-	// Wait indefinitely for one completion
 	int ret = dequeue_one_completion(ctx, INFINITE);
 	if (ret < 0) {
 		return ret;
@@ -1181,14 +1182,12 @@ static int ior_iocp_backend_wait_cqe_timeout(
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Check ready queue first
 	if (!ready_queue_empty(&ctx->ready)) {
 		ior_iocp_op *op = ready_queue_peek(&ctx->ready);
 		*cqe_out = &op->cqe;
 		return 0;
 	}
 
-	// Convert timespec to milliseconds
 	DWORD timeout_ms = INFINITE;
 	if (timeout) {
 		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
@@ -1196,7 +1195,7 @@ static int ior_iocp_backend_wait_cqe_timeout(
 		}
 		timeout_ms = (DWORD) (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000);
 		if (timeout_ms == 0 && (timeout->tv_sec > 0 || timeout->tv_nsec > 0)) {
-			timeout_ms = 1; // At least 1ms
+			timeout_ms = 1;
 		}
 	}
 
@@ -1217,29 +1216,20 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 	}
 
 	ior_ctx_iocp *ctx = backend_ctx;
-
-	// Extract op from CQE
 	ior_iocp_op *op = cqe_to_op(cqe);
 
-	// STRICT: Only consume from head (matches thread backend CQ ring semantics)
-	// Check head first before popping (non-destructive on misuse)
 	ior_iocp_op *head_op = ready_queue_peek(&ctx->ready);
 
 	if (head_op != op) {
-		// ERROR: cqe_seen called out of order
-		// This violates the consumption contract
 		IOR_LOG_ERROR("cqe_seen called out of order - expected %p, got %p", (void *) head_op,
 				(void *) op);
 #ifndef NDEBUG
 		abort(); // Fail fast in debug builds
 #endif
-		return; // Don't corrupt queue in release builds
+		return;
 	}
 
-	// Now safe to pop since we verified it's the head
 	ready_queue_pop(&ctx->ready);
-
-	// Return to free pool
 	free_op(ctx, op);
 }
 
@@ -1251,7 +1241,6 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Cap max to safe bounds
 	if (max > ctx->pool_size) {
 		max = ctx->pool_size;
 	}
@@ -1261,31 +1250,23 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 
 	unsigned count = 0;
 
-	// First, return what's already in ready queue
 	while (count < max && !ready_queue_empty(&ctx->ready)) {
 		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) % ctx->ready.size];
 		cqes[count] = &op->cqe;
 		count++;
 	}
 
-	// Try to fetch more from IOCP to fill up to max
 	unsigned need = max - count;
 	if (need == 0) {
-		return count; // Already filled
+		return count;
 	}
 
-	// Use single-dequeue loop for correctness
-	// GetQueuedCompletionStatusEx doesn't provide per-entry error status reliably
-	// Loop dequeue_one_completion with timeout=0 (non-blocking) to get accurate errors
 	for (unsigned i = 0; i < need; i++) {
 		int ret = dequeue_one_completion(ctx, 0);
 		if (ret < 0) {
-			// No more available (or error) - return what we have
 			break;
 		}
 
-		// Completion was added to ready queue
-		// Add pointer to output array
 		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) % ctx->ready.size];
 		cqes[count] = &op->cqe;
 		count++;
@@ -1302,12 +1283,10 @@ static void ior_iocp_backend_cq_advance(void *backend_ctx, unsigned nr)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Advance ready queue and return ops to pool
-	// This is the batch consumption path (used with peek_batch_cqe)
 	for (unsigned i = 0; i < nr; i++) {
 		ior_iocp_op *op = ready_queue_pop(&ctx->ready);
 		if (!op) {
-			break; // No more in queue
+			break;
 		}
 		free_op(ctx, op);
 	}
@@ -1354,6 +1333,12 @@ static void ior_iocp_backend_prep_splice(ior_sqe *sqe, ior_fd_t fd_in, uint64_t 
 	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
 	op->opcode = IOR_OP_SPLICE;
 	op->fd = NULL;
+	(void) fd_in;
+	(void) off_in;
+	(void) fd_out;
+	(void) off_out;
+	(void) nbytes;
+	(void) flags;
 }
 
 static void ior_iocp_backend_prep_timeout(
@@ -1365,6 +1350,7 @@ static void ior_iocp_backend_prep_timeout(
 	op->fd = NULL;
 	op->timeout_ts = ts;
 	op->timeout_flags = flags;
+	(void) count; // currently unused
 }
 
 static void ior_iocp_backend_sqe_set_data(ior_sqe *sqe, void *data)
