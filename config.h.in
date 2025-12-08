@@ -9,6 +9,7 @@
 #cmakedefine IOR_PLATFORM_WINDOWS
 
 /* Backend availability */
+#cmakedefine IOR_HAVE_THREADS
 #cmakedefine IOR_HAVE_URING
 #cmakedefine IOR_HAVE_IOCP
 

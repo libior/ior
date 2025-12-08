@@ -11,8 +11,11 @@ static ior_backend_type detect_backend(void)
 	return IOR_BACKEND_IOURING;
 #elif defined(IOR_HAVE_IOCP)
 	return IOR_BACKEND_IOCP;
-#else
+#elif defined(IOR_HAVE_THREADS)
 	return IOR_BACKEND_THREADS;
+#else
+	/* Should never happen */
+	return IOR_BACKEND_AUTO;
 #endif
 }
 
@@ -22,10 +25,10 @@ static const ior_backend_ops *get_backend_ops(ior_backend_type backend)
 #ifdef IOR_HAVE_URING
 		case IOR_BACKEND_IOURING:
 			return &ior_uring_ops;
-#endif
+#elif defined(IOR_HAVE_THREADS)
 		case IOR_BACKEND_THREADS:
 			return &ior_threads_ops;
-#ifdef IOR_HAVE_IOCP
+#elif defined(IOR_HAVE_IOCP)
 		case IOR_BACKEND_IOCP:
 			return &ior_iocp_ops;
 #endif

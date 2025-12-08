@@ -14,7 +14,7 @@ static void *signal_thread(void *arg)
 }
 
 // Test event initialization
-static void test_event_init(void **state)
+static void test_threads_event_init(void **state)
 {
 	(void) state;
 
@@ -30,7 +30,7 @@ static void test_event_init(void **state)
 }
 
 // Test event signaling
-static void test_event_signal_wait(void **state)
+static void test_threads_event_signal_wait(void **state)
 {
 	(void) state;
 
@@ -51,7 +51,7 @@ static void test_event_signal_wait(void **state)
 }
 
 // Test event timeout
-static void test_event_timeout(void **state)
+static void test_threads_event_timeout(void **state)
 {
 	(void) state;
 
@@ -68,9 +68,9 @@ static void test_event_timeout(void **state)
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
-		cmocka_unit_test(test_event_init),
-		cmocka_unit_test(test_event_signal_wait),
-		cmocka_unit_test(test_event_timeout),
+		cmocka_unit_test(test_threads_event_init),
+		cmocka_unit_test(test_threads_event_signal_wait),
+		cmocka_unit_test(test_threads_event_timeout),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

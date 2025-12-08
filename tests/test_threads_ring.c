@@ -4,7 +4,7 @@
 #include "../src/ior_threads_ring.h"
 
 // Test ring initialization
-static void test_ring_init(void **state)
+static void test_threads_ring_init(void **state)
 {
 	(void) state;
 
@@ -20,7 +20,7 @@ static void test_ring_init(void **state)
 }
 
 // Test ring operations
-static void test_ring_operations(void **state)
+static void test_threads_ring_operations(void **state)
 {
 	(void) state;
 
@@ -59,8 +59,8 @@ static void test_ring_operations(void **state)
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
-		cmocka_unit_test(test_ring_init),
-		cmocka_unit_test(test_ring_operations),
+		cmocka_unit_test(test_threads_ring_init),
+		cmocka_unit_test(test_threads_ring_operations),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

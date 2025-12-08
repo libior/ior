@@ -14,23 +14,25 @@ if(IOR_HAVE_URING)
     )
 endif()
 
-# Thread pool backend (all platforms)
-list(APPEND IOR_BACKEND_SOURCES
-    ior_threads.c
-    ior_threads_ring.c
-    ior_threads_pool.c
-    ior_threads_event_common.c
-)
+# Thread pool backend (only if needed)
+if(IOR_HAVE_THREADS)
+    list(APPEND IOR_BACKEND_SOURCES
+        ior_threads.c
+        ior_threads_ring.c
+        ior_threads_pool.c
+        ior_threads_event_common.c
+    )
 
-# Thread event implementation
-if(IOR_HAVE_EVENTFD)
-    list(APPEND IOR_BACKEND_SOURCES
-        ior_threads_event_eventfd.c
-    )
-else()
-    list(APPEND IOR_BACKEND_SOURCES
-        ior_threads_event_pipe.c
-    )
+    # Thread event implementation
+    if(IOR_HAVE_EVENTFD)
+        list(APPEND IOR_BACKEND_SOURCES
+            ior_threads_event_eventfd.c
+        )
+    else()
+        list(APPEND IOR_BACKEND_SOURCES
+            ior_threads_event_pipe.c
+        )
+    endif()
 endif()
 
 # Windows IOCP backend
@@ -74,9 +76,11 @@ if(IOR_HAVE_URING)
 endif()
 
 # Platform-specific libraries
-if(NOT IOR_PLATFORM_WINDOWS)
+if(IOR_HAVE_THREADS)
     target_link_libraries(ior PRIVATE pthread)
-else()
+endif()
+
+if(IOR_PLATFORM_WINDOWS)
     # Windows needs different libs
     target_link_libraries(ior PRIVATE ws2_32)
 endif()

@@ -201,7 +201,7 @@ elseif(IOR_FORCE_THREADS)
     message(STATUS "Forcing thread backend (IOR_FORCE_THREADS=ON)")
 endif()
 
-# Check for eventfd
+# Check for eventfd (only if we might need threads)
 set(IOR_HAVE_EVENTFD FALSE)
 if((IOR_PLATFORM_LINUX OR IOR_PLATFORM_FREEBSD) AND NOT IOR_FORCE_PIPE)
     check_c_source_compiles("
@@ -235,11 +235,26 @@ if(IOR_PLATFORM_WINDOWS)
     message(STATUS "Windows IOCP support enabled")
 endif()
 
-# Thread event notification implementation
-if(IOR_HAVE_EVENTFD)
-    message(STATUS "Using eventfd for thread event notification")
+# Determine if thread backend is needed
+set(IOR_HAVE_THREADS FALSE)
+
+if(NOT IOR_PLATFORM_WINDOWS)
+    if(NOT IOR_HAVE_URING OR IOR_FORCE_THREADS)
+        set(IOR_HAVE_THREADS TRUE)
+    endif()
+endif()
+
+if(IOR_HAVE_THREADS)
+    message(STATUS "Thread backend enabled")
+
+    # Thread event notification implementation
+    if(IOR_HAVE_EVENTFD)
+        message(STATUS "Using eventfd for thread event notification")
+    else()
+        message(STATUS "Using pipe for thread event notification")
+    endif()
 else()
-    message(STATUS "Using pipe for thread event notification")
+    message(STATUS "Thread backend disabled (not needed)")
 endif()
 
 # Generate config.h
@@ -295,7 +310,7 @@ if(IOR_HAVE_URING)
 else()
     message(STATUS "  io_uring: FALSE")
 endif()
-message(STATUS "  Threads:  TRUE")
+message(STATUS "  Threads:  ${IOR_HAVE_THREADS}")
 if(IOR_PLATFORM_WINDOWS)
     message(STATUS "  IOCP:     ${IOR_HAVE_IOCP}")
 endif()

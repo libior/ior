@@ -22,6 +22,7 @@ typedef struct ior_cqe_uring {
 } ior_cqe_uring;
 #endif
 
+#ifdef IOR_HAVE_THREADS
 /* Threads backend SQE/CQE */
 typedef struct ior_sqe_threads {
 	uint8_t opcode;
@@ -50,6 +51,7 @@ typedef struct ior_cqe_threads {
 	int32_t res;
 	uint32_t flags;
 } ior_cqe_threads;
+#endif
 
 /* IOCP backend SQE/CQE */
 #ifdef IOR_HAVE_IOCP
@@ -79,27 +81,27 @@ typedef struct ior_cqe_iocp {
 
 /* Actual opaque type definitions - unions of all backend types */
 struct ior_sqe {
-	union {
 #ifdef IOR_HAVE_URING
-		ior_sqe_uring uring;
+	ior_sqe_uring uring;
 #endif
-		ior_sqe_threads threads;
+#ifdef IOR_HAVE_THREADS
+	ior_sqe_threads threads;
+#endif
 #ifdef IOR_HAVE_IOCP
-		ior_sqe_iocp iocp;
+	ior_sqe_iocp iocp;
 #endif
-	};
 };
 
 struct ior_cqe {
-	union {
 #ifdef IOR_HAVE_URING
-		ior_cqe_uring uring;
+	ior_cqe_uring uring;
 #endif
-		ior_cqe_threads threads;
+#ifdef IOR_HAVE_THREADS
+	ior_cqe_threads threads;
+#endif
 #ifdef IOR_HAVE_IOCP
-		ior_cqe_iocp iocp;
+	ior_cqe_iocp iocp;
 #endif
-	};
 };
 
 /* Backend operations vtable */
@@ -153,7 +155,9 @@ struct ior_ctx {
 extern const ior_backend_ops ior_uring_ops;
 #endif
 
+#ifdef IOR_HAVE_THREADS
 extern const ior_backend_ops ior_threads_ops;
+#endif
 
 #ifdef IOR_HAVE_IOCP
 extern const ior_backend_ops ior_iocp_ops;

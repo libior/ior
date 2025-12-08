@@ -5,7 +5,7 @@ This document describes how to build and test the IOR library.
 ## Quick Start
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ior.git
+git clone https://github.com/libior/ior.git
 cd ior
 
 # Configure and build
@@ -142,19 +142,19 @@ cd build
 ctest --output-on-failure
 
 # Verbose output
-ctest --verbose
+ctest --test-dir build --verbose
 
 # Run specific test
-ctest -R test_basic
+ctest --test-dir build -R test_basic
 
 # Run tests matching pattern
-ctest -R thread
+ctest --test-dir build -R thread
 
 # Run in parallel
-ctest -j4
+ctest --test-dir build -j4
 
 # List available tests
-ctest -N
+ctest --test-dir build -N
 ```
 
 ### Running Individual Tests

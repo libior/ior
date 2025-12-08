@@ -13,13 +13,11 @@ target_include_directories(test_utils
 target_link_libraries(test_utils PUBLIC ior cmocka::cmocka)
 apply_sanitizers(test_utils)
 
-# Test executables
+# Test executables - common tests
 set(TESTS
     test_basic
     test_read_write
     test_timeout
-    test_ring
-    test_event
 )
 
 # Add test for splice only on Linux with splice support
@@ -43,16 +41,38 @@ foreach(test ${TESTS})
     set_tests_properties(${test} PROPERTIES TIMEOUT 30)
 endforeach()
 
-# Thread backend tests (always compiled)
-add_executable(test_threads_backend test_threads_backend.c)
-target_include_directories(test_threads_backend PRIVATE 
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_BINARY_DIR}
-)
-target_link_libraries(test_threads_backend PRIVATE test_utils ior cmocka::cmocka)
-apply_sanitizers(test_threads_backend)
-add_test(NAME test_threads_backend COMMAND test_threads_backend)
-set_tests_properties(test_threads_backend PROPERTIES TIMEOUT 30)
+# Thread backend tests (only if thread backend is compiled)
+if(IOR_HAVE_THREADS)
+    # Thread-specific unit tests
+    set(THREAD_TESTS
+        test_threads_ring
+        test_threads_event
+    )
+
+    foreach(test ${THREAD_TESTS})
+        add_executable(${test} ${test}.c)
+        target_include_directories(${test} PRIVATE 
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+        )
+        target_link_libraries(${test} PRIVATE test_utils ior cmocka::cmocka)
+        apply_sanitizers(${test})
+        add_test(NAME ${test} COMMAND ${test})
+        set_tests_properties(${test} PROPERTIES TIMEOUT 30)
+    endforeach()
+
+    # Thread backend integration test
+    add_executable(test_threads_backend test_threads_backend.c)
+    target_include_directories(test_threads_backend PRIVATE 
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_threads_backend PRIVATE test_utils ior cmocka::cmocka)
+    apply_sanitizers(test_threads_backend)
+    add_test(NAME test_threads_backend COMMAND test_threads_backend)
+    set_tests_properties(test_threads_backend PROPERTIES TIMEOUT 30)
+endif()
 
 # io_uring backend tests (only if available)
 if(IOR_HAVE_URING)
