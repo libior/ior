@@ -13,7 +13,6 @@
 #include <stdatomic.h>
 
 // ETIME is used for timer expiration (matches io_uring semantics)
-// On some platforms it may not be defined
 #ifndef ETIME
 #define ETIME 62 // Match Linux value
 #endif
@@ -60,6 +59,17 @@ typedef struct ior_iocp_op {
 	bool timer_armed; // True once enqueued into timer heap
 	bool timer_cancelled; // True if timer was cancelled (future use)
 
+	// Scheduling / ordering
+	uint64_t seq; // submission sequence (1..)
+	uint64_t drain_after; // for DRAIN: must wait until completed_count >= drain_after
+	struct ior_iocp_op *link_next;
+
+	bool linked_deferred; // true while waiting for predecessor in a LINK chain
+	bool drain_deferred; // true while waiting for DRAIN barrier
+
+	// Pending list linkage (for drain-deferred heads, and link-next heads that hit DRAIN)
+	struct ior_iocp_op *next_pending;
+
 	// Result tracking (filled by completion)
 	DWORD bytes_transferred;
 	DWORD error_code;
@@ -101,13 +111,12 @@ typedef struct ior_ctx_iocp {
 	ior_iocp_op *op_pool;
 	uint32_t pool_size;
 
-	// Free list (protected by pool_lock because timer thread may return ops on PQCS
-	// failure/teardown)
+	// Free list (protected because timer thread may free ops on PQCS failure/teardown)
 	CRITICAL_SECTION pool_lock;
 	ior_iocp_op *free_list_head;
 	uint32_t free_count;
 
-	_Atomic uint32_t active_count; // Operations in IOCP (not yet in ready queue)
+	_Atomic uint32_t active_count; // ops published to IOCP but not yet dequeued into ready queue
 
 	// Submission queue (software ring)
 	ior_iocp_op **sq_array;
@@ -125,6 +134,14 @@ typedef struct ior_ctx_iocp {
 	// Handle association tracking
 	handle_set handles;
 
+	// Scheduling / ordering
+	CRITICAL_SECTION sched_lock;
+	ior_iocp_op *pending_head;
+	ior_iocp_op *pending_tail;
+
+	atomic_uint_fast64_t submit_seq; // total submitted (sequence generator)
+	atomic_uint_fast64_t completed_cnt; // total completions dequeued from IOCP (not “seen”)
+
 	uint32_t flags;
 	uint32_t features;
 } ior_ctx_iocp;
@@ -133,7 +150,6 @@ typedef struct ior_ctx_iocp {
  * Helper Functions
  */
 
-// Convert Windows error to errno
 static int win_error_to_errno(DWORD err)
 {
 	switch (err) {
@@ -148,11 +164,11 @@ static int win_error_to_errno(DWORD err)
 		case ERROR_OUTOFMEMORY:
 			return -ENOMEM;
 		case ERROR_TIMEOUT:
-			return -ETIME; // Timer expiration - matches io_uring/threads semantics
+			return -ETIME; // io_uring timeout semantics
 		case ERROR_IO_PENDING:
-			return 0; // Not an error - async in progress
+			return 0;
 		case ERROR_HANDLE_EOF:
-			return 0; // EOF - return 0 bytes
+			return 0;
 		case ERROR_BROKEN_PIPE:
 			return -EPIPE;
 		case ERROR_OPERATION_ABORTED:
@@ -166,7 +182,6 @@ static int win_error_to_errno(DWORD err)
 	}
 }
 
-// Round up to next power of 2
 static uint32_t round_up_pow2(uint32_t n)
 {
 	if (n == 0) {
@@ -182,7 +197,8 @@ static uint32_t round_up_pow2(uint32_t n)
 	return n;
 }
 
-// Ready queue operations
+/* ================= Ready queue ================= */
+
 static int ready_queue_init(ready_queue *q, uint32_t size)
 {
 	q->ops = calloc(size, sizeof(ior_iocp_op *));
@@ -217,7 +233,7 @@ static bool ready_queue_full(ready_queue *q)
 static int ready_queue_push(ready_queue *q, ior_iocp_op *op)
 {
 	if (ready_queue_full(q)) {
-		return -EBUSY; // Critical: cannot drop completions
+		return -EBUSY;
 	}
 	q->ops[q->tail] = op;
 	q->tail = (q->tail + 1) % q->size;
@@ -244,7 +260,8 @@ static ior_iocp_op *ready_queue_pop(ready_queue *q)
 	return op;
 }
 
-// Handle set operations
+/* ================= Handle set ================= */
+
 static void handle_set_init(handle_set *set)
 {
 	memset(set->buckets, 0, sizeof(set->buckets));
@@ -270,7 +287,6 @@ static uint32_t handle_hash(HANDLE h)
 	return (uint32_t) (val % HANDLE_SET_SIZE);
 }
 
-// Check if handle is present (must be called under lock)
 static bool handle_set_contains_locked(handle_set *set, HANDLE h)
 {
 	uint32_t bucket = handle_hash(h);
@@ -284,7 +300,6 @@ static bool handle_set_contains_locked(handle_set *set, HANDLE h)
 	return false;
 }
 
-// Insert handle (must be called under lock, assumes not present)
 static bool handle_set_insert_locked(handle_set *set, HANDLE h)
 {
 	uint32_t bucket = handle_hash(h);
@@ -298,7 +313,8 @@ static bool handle_set_insert_locked(handle_set *set, HANDLE h)
 	return true;
 }
 
-// Initialize op pool and free list
+/* ================= Op pool ================= */
+
 static int init_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 {
 	ctx->op_pool = calloc(size, sizeof(ior_iocp_op));
@@ -309,7 +325,6 @@ static int init_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 	ctx->pool_size = size;
 	ctx->free_count = size;
 
-	// Build free list
 	ctx->free_list_head = &ctx->op_pool[0];
 	for (uint32_t i = 0; i < size - 1; i++) {
 		ctx->op_pool[i].next_free = &ctx->op_pool[i + 1];
@@ -319,14 +334,13 @@ static int init_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 	return 0;
 }
 
-// Allocate op from free list
 static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 {
 	EnterCriticalSection(&ctx->pool_lock);
 
 	if (!ctx->free_list_head) {
 		LeaveCriticalSection(&ctx->pool_lock);
-		return NULL; // Pool exhausted
+		return NULL;
 	}
 
 	ior_iocp_op *op = ctx->free_list_head;
@@ -335,7 +349,6 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 
 	LeaveCriticalSection(&ctx->pool_lock);
 
-	// Clear only the request fields and OVERLAPPED, preserve next_free
 	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
 	op->opcode = 0;
 	op->sqe_flags = 0;
@@ -345,20 +358,28 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->buf = NULL;
 	op->len = 0;
 	op->offset = 0;
+
 	op->timeout_ts = NULL;
 	op->timeout_flags = 0;
+
 	op->timer_deadline_ns = 0;
 	op->timer_armed = false;
 	op->timer_cancelled = false;
+
+	op->seq = 0;
+	op->drain_after = 0;
+	op->link_next = NULL;
+	op->linked_deferred = false;
+	op->drain_deferred = false;
+	op->next_pending = NULL;
+
 	op->bytes_transferred = 0;
 	op->error_code = 0;
 	op->is_synthetic = false;
-	// Do NOT clear next_free or cqe
 
 	return op;
 }
 
-// Return op to free list
 static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	if (!op) {
@@ -374,7 +395,8 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	LeaveCriticalSection(&ctx->pool_lock);
 }
 
-// Initialize submission queue
+/* ================= SQ ring ================= */
+
 static int init_sq_ring(ior_ctx_iocp *ctx, uint32_t size)
 {
 	size = round_up_pow2(size);
@@ -392,22 +414,65 @@ static int init_sq_ring(ior_ctx_iocp *ctx, uint32_t size)
 	return 0;
 }
 
-// Add op to SQ ring
 static int sq_enqueue(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	uint32_t next_tail = (ctx->sq_tail + 1) & ctx->sq_mask;
-
 	if (next_tail == ctx->sq_head) {
-		return -EBUSY; // Ring full
+		return -EBUSY;
 	}
 
 	ctx->sq_array[ctx->sq_tail] = op;
 	ctx->sq_tail = next_tail;
-
 	return 0;
 }
 
-// Post synthetic completion for immediate results
+/* ================= Scheduling helpers (LINK/DRAIN) ================= */
+
+static void pending_enqueue_locked(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	// ctx->sched_lock must be held
+	op->next_pending = NULL;
+
+	if (!ctx->pending_tail) {
+		ctx->pending_head = ctx->pending_tail = op;
+	} else {
+		ctx->pending_tail->next_pending = op;
+		ctx->pending_tail = op;
+	}
+}
+
+static void pending_remove_locked(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	// ctx->sched_lock must be held
+	ior_iocp_op *prev = NULL;
+	ior_iocp_op *cur = ctx->pending_head;
+
+	while (cur) {
+		if (cur == op) {
+			if (prev) {
+				prev->next_pending = cur->next_pending;
+			} else {
+				ctx->pending_head = cur->next_pending;
+			}
+			if (ctx->pending_tail == cur) {
+				ctx->pending_tail = prev;
+			}
+			cur->next_pending = NULL;
+			return;
+		}
+		prev = cur;
+		cur = cur->next_pending;
+	}
+}
+
+static bool drain_satisfied(ior_ctx_iocp *ctx, const ior_iocp_op *op)
+{
+	uint64_t done = atomic_load(&ctx->completed_cnt);
+	return done >= op->drain_after;
+}
+
+/* ================= IO issue / completion plumbing ================= */
+
 static int post_synthetic_completion(
 		ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code, DWORD bytes_transferred)
 {
@@ -415,27 +480,20 @@ static int post_synthetic_completion(
 	op->bytes_transferred = bytes_transferred;
 	op->is_synthetic = true;
 
-	// Ensure the op fields are visible before we publish it via IOCP.
 	MemoryBarrier();
 
-	// Post to IOCP so it will be dequeued normally
 	BOOL result
 			= PostQueuedCompletionStatus(ctx->iocp_handle, bytes_transferred, 0, &op->overlapped);
 
 	if (!result) {
-		// PQCS failed - cannot post completion
-		// Return op to pool and don't count as active
 		free_op(ctx, op);
 		return -EIO;
 	}
 
-	// Count as active (will be decremented on dequeue)
 	atomic_fetch_add(&ctx->active_count, 1);
 	return 0;
 }
 
-// Ensure handle is associated with IOCP (lazy association)
-// Holds lock across entire operation to prevent TOCTOU races
 static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 {
 	if (h == NULL || h == INVALID_HANDLE_VALUE) {
@@ -444,13 +502,11 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 
 	EnterCriticalSection(&ctx->handles.lock);
 
-	// Check if already associated
 	if (handle_set_contains_locked(&ctx->handles, h)) {
 		LeaveCriticalSection(&ctx->handles.lock);
 		return 0;
 	}
 
-	// Associate handle with IOCP (while holding lock to prevent races)
 	HANDLE result = CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0);
 	if (result == NULL) {
 		DWORD err = GetLastError();
@@ -458,76 +514,60 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 		return win_error_to_errno(err);
 	}
 
-	// Association succeeded - insert into set
 	(void) handle_set_insert_locked(&ctx->handles, h);
 	LeaveCriticalSection(&ctx->handles.lock);
 
-	// Insertion failure is non-fatal (we'll try to associate again next time)
 	return 0;
 }
 
-// Issue a read operation
 static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
 
-	// Ensure handle is associated with IOCP
 	int ret = ensure_handle_associated(ctx, h);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
 
-	// Set offset in OVERLAPPED
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
 
 	BOOL result = ReadFile(h, op->buf, op->len, NULL, &op->overlapped);
-
 	if (!result) {
 		DWORD err = GetLastError();
 		if (err != ERROR_IO_PENDING) {
-			// Immediate error - post synthetic completion
 			return post_synthetic_completion(ctx, op, err, 0);
 		}
 	}
 
-	// Either pending or completed synchronously
-	// In both cases, completion will arrive via IOCP
 	atomic_fetch_add(&ctx->active_count, 1);
 	return 0;
 }
 
-// Issue a write operation
 static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
 
-	// Ensure handle is associated with IOCP
 	int ret = ensure_handle_associated(ctx, h);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
 
-	// Set offset in OVERLAPPED
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
 
 	BOOL result = WriteFile(h, op->buf, op->len, NULL, &op->overlapped);
-
 	if (!result) {
 		DWORD err = GetLastError();
 		if (err != ERROR_IO_PENDING) {
-			// Immediate error - post synthetic completion
 			return post_synthetic_completion(ctx, op, err, 0);
 		}
 	}
 
-	// Either pending or completed synchronously
 	atomic_fetch_add(&ctx->active_count, 1);
 	return 0;
 }
 
-// Fill CQE from completed operation
 static void op_to_cqe(ior_iocp_op *op)
 {
 	op->cqe.iocp.user_data = op->user_data;
@@ -540,18 +580,14 @@ static void op_to_cqe(ior_iocp_op *op)
 	}
 }
 
-// Extract op from CQE pointer (reverse of &op->cqe)
 static ior_iocp_op *cqe_to_op(ior_cqe *cqe)
 {
 	size_t offset = offsetof(ior_iocp_op, cqe);
 	return (ior_iocp_op *) ((char *) cqe - offset);
 }
 
-/*
- * Timer Support - QueryPerformanceCounter for monotonic time
- */
+/* ================= Timer support ================= */
 
-// Get current time in nanoseconds (monotonic), overflow-safe conversion
 static uint64_t qpc_now_ns(void)
 {
 	static LARGE_INTEGER freq = { 0 };
@@ -571,7 +607,6 @@ static uint64_t qpc_now_ns(void)
 	return sec * 1000000000ULL + (rem * 1000000000ULL) / f;
 }
 
-// Convert timespec to absolute deadline (relative timeout)
 static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts)
 {
 	uint64_t now = qpc_now_ns();
@@ -579,10 +614,7 @@ static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts)
 	return now + delta_ns;
 }
 
-/*
- * Timer Heap - Min-heap of ior_iocp_op* by timer_deadline_ns
- */
-
+/* Timer heap */
 static void timer_heap_swap(timer_mgr *tm, uint32_t i, uint32_t j)
 {
 	ior_iocp_op *tmp = tm->heap[i];
@@ -635,12 +667,10 @@ static int timer_heap_push(timer_mgr *tm, ior_iocp_op *op)
 		if (new_cap < 16) {
 			new_cap = 16;
 		}
-
 		ior_iocp_op **new_heap = realloc(tm->heap, new_cap * sizeof(ior_iocp_op *));
 		if (!new_heap) {
 			return -ENOMEM;
 		}
-
 		tm->heap = new_heap;
 		tm->heap_cap = new_cap;
 	}
@@ -648,7 +678,6 @@ static int timer_heap_push(timer_mgr *tm, ior_iocp_op *op)
 	tm->heap[tm->heap_len] = op;
 	timer_heap_sift_up(tm, tm->heap_len);
 	tm->heap_len++;
-
 	return 0;
 }
 
@@ -677,10 +706,6 @@ static ior_iocp_op *timer_heap_peek(timer_mgr *tm)
 	return tm->heap[0];
 }
 
-/*
- * Timer Thread
- */
-
 static DWORD WINAPI timer_thread_main(LPVOID arg)
 {
 	ior_ctx_iocp *ctx = (ior_ctx_iocp *) arg;
@@ -703,19 +728,16 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 		}
 
 		uint64_t now = qpc_now_ns();
-
 		if (op->timer_deadline_ns > now) {
 			uint64_t delta_ns = op->timer_deadline_ns - now;
 			DWORD wait_ms = (DWORD) (delta_ns / 1000000ULL);
 			if (wait_ms == 0) {
 				wait_ms = 1;
 			}
-
 			SleepConditionVariableCS(&tm->cv, &tm->lock, wait_ms);
 			continue;
 		}
 
-		// Deadline reached - pop and complete
 		op = timer_heap_pop(tm);
 		op->timer_armed = false;
 
@@ -730,7 +752,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 		EnterCriticalSection(&tm->lock);
 
 		if (!ok) {
-			// Couldn't publish completion -> undo "active" and return op to pool
+			// timer arming already accounted for active_count; undo it if we can't publish
 			atomic_fetch_sub(&ctx->active_count, 1);
 			free_op(ctx, op);
 		}
@@ -740,9 +762,6 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 	return 0;
 }
 
-// Arm a timer (called from submit for IOR_OP_TIMER)
-// This function MUST either publish a completion (synthetic) or ensure the op is still live.
-// It should not return a negative error without also finalizing the op.
 static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	if (!op->timeout_ts) {
@@ -779,9 +798,141 @@ static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return 0;
 }
 
-/*
- * Backend Operations
- */
+/* ================= LINK/DRAIN core ================= */
+
+static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op); // forward
+
+static void cancel_link_chain(ior_ctx_iocp *ctx, ior_iocp_op *first)
+{
+	// Cancel all remaining linked ops (that were not yet issued) with -ECANCELED.
+	ior_iocp_op *cur = first;
+
+	while (cur) {
+		ior_iocp_op *next = cur->link_next;
+		cur->link_next = NULL;
+
+		// If it might be sitting in the pending drain list, remove it.
+		EnterCriticalSection(&ctx->sched_lock);
+		if (cur->drain_deferred) {
+			pending_remove_locked(ctx, cur);
+			cur->drain_deferred = false;
+		}
+		LeaveCriticalSection(&ctx->sched_lock);
+
+		// It's still not issued (linked_deferred and/or drain_deferred heads). Complete it now.
+		// Use ERROR_OPERATION_ABORTED => -ECANCELED via win_error_to_errno().
+		(void) post_synthetic_completion(ctx, cur, ERROR_OPERATION_ABORTED, 0);
+
+		cur = next;
+	}
+}
+
+static void sched_kick_drain(ior_ctx_iocp *ctx)
+{
+	// Try to issue any drain-deferred ops whose barrier is now satisfied.
+	// Runs with ctx->sched_lock held by caller OR takes it internally.
+	EnterCriticalSection(&ctx->sched_lock);
+
+	ior_iocp_op *prev = NULL;
+	ior_iocp_op *cur = ctx->pending_head;
+
+	while (cur) {
+		ior_iocp_op *next = cur->next_pending;
+
+		// Only consider “heads” (not waiting on LINK predecessor).
+		if (!cur->linked_deferred && cur->drain_deferred && drain_satisfied(ctx, cur)) {
+			// Remove from pending list
+			if (prev) {
+				prev->next_pending = next;
+			} else {
+				ctx->pending_head = next;
+			}
+			if (ctx->pending_tail == cur) {
+				ctx->pending_tail = prev;
+			}
+			cur->next_pending = NULL;
+			cur->drain_deferred = false;
+
+			LeaveCriticalSection(&ctx->sched_lock);
+
+			// Issue outside lock
+			int ret = issue_op(ctx, cur);
+			if (ret < 0) {
+				// If issuing failed in a LINK chain, cancel remaining
+				if (cur->link_next) {
+					cancel_link_chain(ctx, cur->link_next);
+					cur->link_next = NULL;
+				}
+			}
+
+			EnterCriticalSection(&ctx->sched_lock);
+
+			// Restart scan since we dropped the lock and issued work.
+			prev = NULL;
+			cur = ctx->pending_head;
+			continue;
+		}
+
+		prev = cur;
+		cur = next;
+	}
+
+	LeaveCriticalSection(&ctx->sched_lock);
+}
+
+static int start_link_next(ior_ctx_iocp *ctx, ior_iocp_op *next)
+{
+	if (!next) {
+		return 0;
+	}
+
+	// This op is no longer waiting on predecessor; it becomes the head.
+	next->linked_deferred = false;
+
+	// If it also has DRAIN, it must wait until its barrier is satisfied.
+	if ((next->sqe_flags & IOR_SQE_IO_DRAIN) && !drain_satisfied(ctx, next)) {
+		EnterCriticalSection(&ctx->sched_lock);
+		next->drain_deferred = true;
+		pending_enqueue_locked(ctx, next);
+		LeaveCriticalSection(&ctx->sched_lock);
+		return 0;
+	}
+
+	int ret = issue_op(ctx, next);
+	if (ret < 0) {
+		// Issue failed immediately, cancel remainder of chain
+		if (next->link_next) {
+			cancel_link_chain(ctx, next->link_next);
+			next->link_next = NULL;
+		}
+	}
+	return 0;
+}
+
+static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	switch (op->opcode) {
+		case IOR_OP_NOP:
+			return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+
+		case IOR_OP_READ:
+			return issue_read(ctx, op);
+
+		case IOR_OP_WRITE:
+			return issue_write(ctx, op);
+
+		case IOR_OP_SPLICE:
+			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+
+		case IOR_OP_TIMER:
+			return arm_timer(ctx, op);
+
+		default:
+			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+	}
+}
+
+/* ================= Backend ops ================= */
 
 static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 {
@@ -824,9 +975,16 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	handle_set_init(&ctx->handles);
 
 	InitializeCriticalSection(&ctx->pool_lock);
+	InitializeCriticalSection(&ctx->sched_lock);
+	ctx->pending_head = NULL;
+	ctx->pending_tail = NULL;
+
+	atomic_store(&ctx->submit_seq, 0);
+	atomic_store(&ctx->completed_cnt, 0);
 
 	ret = init_op_pool(ctx, sq_entries);
 	if (ret < 0) {
+		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
@@ -838,6 +996,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	ret = init_sq_ring(ctx, sq_entries);
 	if (ret < 0) {
 		free(ctx->op_pool);
+		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
@@ -846,7 +1005,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return ret;
 	}
 
-	// Initialize timer manager
+	// Timer manager
 	InitializeCriticalSection(&ctx->timers.lock);
 	InitializeConditionVariable(&ctx->timers.cv);
 
@@ -863,6 +1022,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		DeleteCriticalSection(&ctx->timers.lock);
 		free(ctx->sq_array);
 		free(ctx->op_pool);
+		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
@@ -880,6 +1040,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		DeleteCriticalSection(&ctx->timers.lock);
 		free(ctx->sq_array);
 		free(ctx->op_pool);
+		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
 		handle_set_destroy(&ctx->handles);
@@ -888,7 +1049,6 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return -ENOMEM;
 	}
 
-	// Set features (no splice on Windows)
 	ctx->features = IOR_FEAT_NATIVE_ASYNC;
 	params->features = ctx->features;
 
@@ -904,9 +1064,8 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Stop timer thread first
+	// Stop timer thread
 	atomic_store(&ctx->timers.stop, 1);
-
 	EnterCriticalSection(&ctx->timers.lock);
 	WakeConditionVariable(&ctx->timers.cv);
 	LeaveCriticalSection(&ctx->timers.lock);
@@ -914,7 +1073,7 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	WaitForSingleObject(ctx->timers.thread, INFINITE);
 	CloseHandle(ctx->timers.thread);
 
-	// Drain any still-armed timers to keep active_count consistent and avoid destroy hangs.
+	// Drain timers without posting
 	EnterCriticalSection(&ctx->timers.lock);
 	while (ctx->timers.heap_len > 0) {
 		ior_iocp_op *op = timer_heap_pop(&ctx->timers);
@@ -922,11 +1081,7 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 			break;
 		}
 		op->timer_armed = false;
-
-		// This timer had incremented active_count when armed.
 		atomic_fetch_sub(&ctx->active_count, 1);
-
-		// Return op to pool (do NOT post completions during destroy).
 		free_op(ctx, op);
 	}
 	LeaveCriticalSection(&ctx->timers.lock);
@@ -936,8 +1091,23 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		free(ctx->timers.heap);
 	}
 
-	// TODO: Better cleanup - cancel pending operations with CancelIoEx
-	// For now, busy-wait (not ideal but simple)
+	// Cancel any pending (deferred) ops without posting completions (teardown)
+	EnterCriticalSection(&ctx->sched_lock);
+	ior_iocp_op *p = ctx->pending_head;
+	ctx->pending_head = ctx->pending_tail = NULL;
+	LeaveCriticalSection(&ctx->sched_lock);
+
+	while (p) {
+		ior_iocp_op *next = p->next_pending;
+		p->next_pending = NULL;
+		p->drain_deferred = false;
+		p->linked_deferred = false;
+		// Not published to IOCP -> safe to free
+		free_op(ctx, p);
+		p = next;
+	}
+
+	// Busy-wait for in-flight completions to be dequeued (same as before)
 	while (atomic_load(&ctx->active_count) > 0) {
 		Sleep(1);
 	}
@@ -948,11 +1118,11 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	if (ctx->sq_array) {
 		free(ctx->sq_array);
 	}
-
 	if (ctx->op_pool) {
 		free(ctx->op_pool);
 	}
 
+	DeleteCriticalSection(&ctx->sched_lock);
 	DeleteCriticalSection(&ctx->pool_lock);
 
 	if (ctx->iocp_handle) {
@@ -990,39 +1160,57 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 	}
 
 	ior_ctx_iocp *ctx = backend_ctx;
+
 	uint32_t submitted = 0;
 	int last_error = 0;
+
+	ior_iocp_op *prev = NULL;
 
 	while (ctx->sq_head != ctx->sq_tail) {
 		ior_iocp_op *op = ctx->sq_array[ctx->sq_head];
 		ctx->sq_head = (ctx->sq_head + 1) & ctx->sq_mask;
 
+		// Assign submission sequence
+		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
+
+		// DRAIN barrier means “wait for all prior completions”
+		if (op->sqe_flags & IOR_SQE_IO_DRAIN) {
+			op->drain_after = op->seq - 1;
+		} else {
+			op->drain_after = 0;
+		}
+
+		// Build LINK chain (prev is the predecessor if it had LINK set)
+		if (prev && (prev->sqe_flags & IOR_SQE_IO_LINK)) {
+			prev->link_next = op;
+			op->linked_deferred = true;
+		} else {
+			op->linked_deferred = false;
+		}
+
+		// Decide whether to issue now
 		int ret = 0;
 
-		switch (op->opcode) {
-			case IOR_OP_NOP:
-				ret = post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
-				break;
-
-			case IOR_OP_READ:
-				ret = issue_read(ctx, op);
-				break;
-
-			case IOR_OP_WRITE:
-				ret = issue_write(ctx, op);
-				break;
-
-			case IOR_OP_SPLICE:
-				ret = post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
-				break;
-
-			case IOR_OP_TIMER:
-				ret = arm_timer(ctx, op);
-				break;
-
-			default:
-				ret = post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
-				break;
+		if (op->linked_deferred) {
+			// Not a head: will be issued when predecessor completes successfully.
+			ret = 0;
+		} else if ((op->sqe_flags & IOR_SQE_IO_DRAIN) && !drain_satisfied(ctx, op)) {
+			// Head but drain-deferred
+			EnterCriticalSection(&ctx->sched_lock);
+			op->drain_deferred = true;
+			pending_enqueue_locked(ctx, op);
+			LeaveCriticalSection(&ctx->sched_lock);
+			ret = 0;
+		} else {
+			op->drain_deferred = false;
+			ret = issue_op(ctx, op);
+			if (ret < 0) {
+				// If issuing the head failed immediately, cancel remaining chain.
+				if (op->link_next) {
+					cancel_link_chain(ctx, op->link_next);
+					op->link_next = NULL;
+				}
+			}
 		}
 
 		if (ret < 0) {
@@ -1030,7 +1218,12 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		} else {
 			submitted++;
 		}
+
+		prev = op;
 	}
+
+	// If we deferred drains, a completion might already satisfy them; cheap kick.
+	sched_kick_drain(ctx);
 
 	if (last_error < 0 && submitted == 0) {
 		return last_error;
@@ -1039,7 +1232,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 	return (int) submitted;
 }
 
-// Helper to dequeue one completion from IOCP into ready queue
+/* Dequeue one completion and push into ready queue */
 static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 {
 	if (ready_queue_full(&ctx->ready)) {
@@ -1047,9 +1240,9 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		return -EBUSY;
 	}
 
-	DWORD bytes_transferred;
-	ULONG_PTR completion_key;
-	LPOVERLAPPED overlapped;
+	DWORD bytes_transferred = 0;
+	ULONG_PTR completion_key = 0;
+	LPOVERLAPPED overlapped = NULL;
 
 	BOOL ok = GetQueuedCompletionStatus(
 			ctx->iocp_handle, &bytes_transferred, &completion_key, &overlapped, timeout_ms);
@@ -1063,6 +1256,7 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 			}
 			return win_error_to_errno(gle);
 		}
+		// completion with error: proceed (gle carries error)
 	}
 
 	if (overlapped == NULL) {
@@ -1077,11 +1271,14 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	}
 
 #ifndef NDEBUG
-	uint32_t prev = atomic_fetch_sub(&ctx->active_count, 1);
-	assert(prev > 0 && "active_count underflow detected");
+	uint32_t prev_active = atomic_fetch_sub(&ctx->active_count, 1);
+	assert(prev_active > 0 && "active_count underflow detected");
 #else
 	atomic_fetch_sub(&ctx->active_count, 1);
 #endif
+
+	// Mark completion (for DRAIN barriers)
+	atomic_fetch_add(&ctx->completed_cnt, 1);
 
 	op_to_cqe(op);
 
@@ -1090,6 +1287,21 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		IOR_LOG_ERROR("Ready queue push failed unexpectedly");
 		return ret;
 	}
+
+	// LINK handling: on successful completion, start next; otherwise cancel the chain.
+	ior_iocp_op *next = op->link_next;
+	op->link_next = NULL;
+
+	if (next) {
+		if (op->cqe.iocp.res >= 0) {
+			(void) start_link_next(ctx, next);
+		} else {
+			cancel_link_chain(ctx, next);
+		}
+	}
+
+	// DRAIN handling: newly completed ops may unblock drain-deferred heads
+	sched_kick_drain(ctx);
 
 	return 0;
 }
@@ -1224,7 +1436,7 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 		IOR_LOG_ERROR("cqe_seen called out of order - expected %p, got %p", (void *) head_op,
 				(void *) op);
 #ifndef NDEBUG
-		abort(); // Fail fast in debug builds
+		abort();
 #endif
 		return;
 	}
@@ -1257,16 +1469,11 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 	}
 
 	unsigned need = max - count;
-	if (need == 0) {
-		return count;
-	}
-
 	for (unsigned i = 0; i < need; i++) {
 		int ret = dequeue_one_completion(ctx, 0);
 		if (ret < 0) {
 			break;
 		}
-
 		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) % ctx->ready.size];
 		cqes[count] = &op->cqe;
 		count++;
@@ -1292,7 +1499,7 @@ static void ior_iocp_backend_cq_advance(void *backend_ctx, unsigned nr)
 	}
 }
 
-/* SQE preparation helpers */
+/* ================= SQE preparation helpers ================= */
 
 static void ior_iocp_backend_prep_nop(ior_sqe *sqe)
 {
@@ -1350,7 +1557,7 @@ static void ior_iocp_backend_prep_timeout(
 	op->fd = NULL;
 	op->timeout_ts = ts;
 	op->timeout_flags = flags;
-	(void) count; // currently unused
+	(void) count;
 }
 
 static void ior_iocp_backend_sqe_set_data(ior_sqe *sqe, void *data)
@@ -1365,7 +1572,7 @@ static void ior_iocp_backend_sqe_set_flags(ior_sqe *sqe, uint8_t flags)
 	op->sqe_flags = flags;
 }
 
-/* CQE accessors */
+/* ================= CQE accessors ================= */
 
 static void *ior_iocp_backend_cqe_get_data(ior_cqe *cqe)
 {
@@ -1382,7 +1589,7 @@ static uint32_t ior_iocp_backend_cqe_get_flags(ior_cqe *cqe)
 	return cqe->iocp.flags;
 }
 
-/* Backend info */
+/* ================= Backend info ================= */
 
 static const char *ior_iocp_backend_name(void)
 {
@@ -1394,7 +1601,6 @@ static uint32_t ior_iocp_backend_get_features(void *backend_ctx)
 	if (!backend_ctx) {
 		return 0;
 	}
-
 	ior_ctx_iocp *ctx = backend_ctx;
 	return ctx->features;
 }
