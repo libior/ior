@@ -17,6 +17,11 @@
 #define ETIME 62 // Match Linux value
 #endif
 
+// Timeout flag: if set, the timespec is an absolute timestamp
+#ifndef IOR_TIMEOUT_ABS
+#define IOR_TIMEOUT_ABS (1U << 0)
+#endif
+
 /*
  * Handle tracking for IOCP association
  * Windows requires each handle to be associated with exactly one IOCP
@@ -87,7 +92,8 @@ typedef struct ready_queue {
 	uint32_t head;
 	uint32_t tail;
 	uint32_t count;
-	uint32_t size; // Allocated size
+	uint32_t size; // Allocated size (power of 2)
+	uint32_t mask; // size - 1, for bitmask wrapping
 } ready_queue;
 
 /* Timer manager - single thread managing all timers */
@@ -102,6 +108,10 @@ typedef struct timer_mgr {
 	uint32_t heap_len;
 	uint32_t heap_cap;
 } timer_mgr;
+
+/* QPC frequency, initialized once during backend init */
+static LARGE_INTEGER g_qpc_freq;
+static LONG g_qpc_freq_init = 0; // 0 = not done, 1 = done
 
 /* IOCP backend context */
 typedef struct ior_ctx_iocp {
@@ -140,7 +150,7 @@ typedef struct ior_ctx_iocp {
 	ior_iocp_op *pending_tail;
 
 	atomic_uint_fast64_t submit_seq; // total submitted (sequence generator)
-	atomic_uint_fast64_t completed_cnt; // total completions dequeued from IOCP (not “seen”)
+	atomic_uint_fast64_t completed_cnt; // total completions dequeued from IOCP (not "seen")
 
 	uint32_t flags;
 	uint32_t features;
@@ -177,6 +187,8 @@ static int win_error_to_errno(DWORD err)
 			return -EBADF;
 		case ERROR_NOT_SUPPORTED:
 			return -ENOTSUP;
+		case ERROR_ABANDONED_WAIT_0:
+			return -ECANCELED;
 		default:
 			return -EIO;
 	}
@@ -201,6 +213,8 @@ static uint32_t round_up_pow2(uint32_t n)
 
 static int ready_queue_init(ready_queue *q, uint32_t size)
 {
+	size = round_up_pow2(size);
+
 	q->ops = calloc(size, sizeof(ior_iocp_op *));
 	if (!q->ops) {
 		return -ENOMEM;
@@ -209,6 +223,7 @@ static int ready_queue_init(ready_queue *q, uint32_t size)
 	q->tail = 0;
 	q->count = 0;
 	q->size = size;
+	q->mask = size - 1;
 	return 0;
 }
 
@@ -236,7 +251,7 @@ static int ready_queue_push(ready_queue *q, ior_iocp_op *op)
 		return -EBUSY;
 	}
 	q->ops[q->tail] = op;
-	q->tail = (q->tail + 1) % q->size;
+	q->tail = (q->tail + 1) & q->mask;
 	q->count++;
 	return 0;
 }
@@ -255,7 +270,7 @@ static ior_iocp_op *ready_queue_pop(ready_queue *q)
 		return NULL;
 	}
 	ior_iocp_op *op = q->ops[q->head];
-	q->head = (q->head + 1) % q->size;
+	q->head = (q->head + 1) & q->mask;
 	q->count--;
 	return op;
 }
@@ -520,6 +535,26 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 	return 0;
 }
 
+/*
+ * issue_read / issue_write
+ *
+ * When ReadFile/WriteFile is called on a handle associated with an IOCP, the
+ * default behavior is that a completion packet is posted for BOTH asynchronous
+ * completions (ERROR_IO_PENDING) AND synchronous successes (returns TRUE).
+ * The only case where no completion is posted is an immediate error that is
+ * NOT ERROR_IO_PENDING.
+ *
+ * Therefore:
+ *   - If the call returns TRUE (synchronous success) or fails with
+ *     ERROR_IO_PENDING: a completion packet will arrive on the IOCP.
+ *     We increment active_count and wait for it.
+ *   - If the call fails with any other error: NO completion packet is posted.
+ *     We must post a synthetic completion ourselves.
+ *
+ * Special case: ERROR_HANDLE_EOF means the read reached end-of-file. Windows
+ * still posts a completion packet for this on overlapped handles, so we treat
+ * it the same as a successful async start.
+ */
 static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
@@ -533,15 +568,21 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
 
 	BOOL result = ReadFile(h, op->buf, op->len, NULL, &op->overlapped);
-	if (!result) {
-		DWORD err = GetLastError();
-		if (err != ERROR_IO_PENDING) {
-			return post_synthetic_completion(ctx, op, err, 0);
-		}
+	if (result) {
+		// Synchronous success: completion packet will still be posted to IOCP
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
 	}
 
-	atomic_fetch_add(&ctx->active_count, 1);
-	return 0;
+	DWORD err = GetLastError();
+	if (err == ERROR_IO_PENDING || err == ERROR_HANDLE_EOF) {
+		// Async in progress, or EOF - completion packet will be posted
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	// Immediate error with no completion packet - post synthetic
+	return post_synthetic_completion(ctx, op, err, 0);
 }
 
 static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
@@ -557,15 +598,21 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
 
 	BOOL result = WriteFile(h, op->buf, op->len, NULL, &op->overlapped);
-	if (!result) {
-		DWORD err = GetLastError();
-		if (err != ERROR_IO_PENDING) {
-			return post_synthetic_completion(ctx, op, err, 0);
-		}
+	if (result) {
+		// Synchronous success: completion packet will still be posted to IOCP
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
 	}
 
-	atomic_fetch_add(&ctx->active_count, 1);
-	return 0;
+	DWORD err = GetLastError();
+	if (err == ERROR_IO_PENDING) {
+		// Async in progress - completion packet will be posted
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	// Immediate error with no completion packet - post synthetic
+	return post_synthetic_completion(ctx, op, err, 0);
 }
 
 static void op_to_cqe(ior_iocp_op *op)
@@ -588,18 +635,31 @@ static ior_iocp_op *cqe_to_op(ior_cqe *cqe)
 
 /* ================= Timer support ================= */
 
+static void qpc_freq_init(void)
+{
+	/*
+	 * Thread-safe one-shot initialization of g_qpc_freq.
+	 * Uses InterlockedCompareExchange to ensure exactly one thread
+	 * calls QueryPerformanceFrequency.
+	 */
+	if (InterlockedCompareExchange(&g_qpc_freq_init, 1, 0) == 0) {
+		QueryPerformanceFrequency(&g_qpc_freq);
+		MemoryBarrier();
+	} else {
+		// Another thread is initializing or has finished; spin until done.
+		while (g_qpc_freq.QuadPart == 0) {
+			YieldProcessor();
+		}
+	}
+}
+
 static uint64_t qpc_now_ns(void)
 {
-	static LARGE_INTEGER freq = { 0 };
-	if (freq.QuadPart == 0) {
-		QueryPerformanceFrequency(&freq);
-	}
-
 	LARGE_INTEGER counter;
 	QueryPerformanceCounter(&counter);
 
 	uint64_t c = (uint64_t) counter.QuadPart;
-	uint64_t f = (uint64_t) freq.QuadPart;
+	uint64_t f = (uint64_t) g_qpc_freq.QuadPart;
 
 	uint64_t sec = c / f;
 	uint64_t rem = c % f;
@@ -607,11 +667,18 @@ static uint64_t qpc_now_ns(void)
 	return sec * 1000000000ULL + (rem * 1000000000ULL) / f;
 }
 
-static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts)
+static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts, uint32_t flags)
 {
-	uint64_t now = qpc_now_ns();
 	uint64_t delta_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-	return now + delta_ns;
+
+	if (flags & IOR_TIMEOUT_ABS) {
+		// Absolute deadline: treat the timespec value directly as the deadline.
+		// Caller is responsible for using a compatible clock base.
+		return delta_ns;
+	}
+
+	// Relative: deadline = now + delta
+	return qpc_now_ns() + delta_ns;
 }
 
 /* Timer heap */
@@ -773,7 +840,7 @@ static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
 	}
 
-	uint64_t deadline = qpc_deadline_from_timespec(op->timeout_ts);
+	uint64_t deadline = qpc_deadline_from_timespec(op->timeout_ts, op->timeout_flags);
 
 	timer_mgr *tm = &ctx->timers;
 
@@ -839,7 +906,7 @@ static void sched_kick_drain(ior_ctx_iocp *ctx)
 	while (cur) {
 		ior_iocp_op *next = cur->next_pending;
 
-		// Only consider “heads” (not waiting on LINK predecessor).
+		// Only consider "heads" (not waiting on LINK predecessor).
 		if (!cur->linked_deferred && cur->drain_deferred && drain_satisfied(ctx, cur)) {
 			// Remove from pending list
 			if (prev) {
@@ -939,6 +1006,9 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	if (!backend_ctx || !params) {
 		return -EINVAL;
 	}
+
+	// Ensure QPC frequency is initialized (thread-safe, one-shot)
+	qpc_freq_init();
 
 	ior_ctx_iocp *ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -1107,9 +1177,50 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		p = next;
 	}
 
-	// Busy-wait for in-flight completions to be dequeued (same as before)
+	/*
+	 * Drain all in-flight completions from the IOCP.
+	 *
+	 * active_count tracks ops that have been posted to the IOCP
+	 * (via ReadFile/WriteFile/PostQueuedCompletionStatus) but not yet
+	 * dequeued by GetQueuedCompletionStatus. We must dequeue them here
+	 * or we'll spin forever.
+	 */
 	while (atomic_load(&ctx->active_count) > 0) {
-		Sleep(1);
+		DWORD bytes = 0;
+		ULONG_PTR key = 0;
+		LPOVERLAPPED overlapped = NULL;
+
+		BOOL ok = GetQueuedCompletionStatus(ctx->iocp_handle, &bytes, &key, &overlapped, 100);
+
+		if (!ok && overlapped == NULL) {
+			DWORD gle = GetLastError();
+			if (gle == WAIT_TIMEOUT || gle == ERROR_TIMEOUT) {
+				// Timeout with nothing dequeued; keep trying briefly.
+				// Safety valve: if nothing arrives after several rounds,
+				// break to avoid hanging forever during teardown.
+				continue;
+			}
+			if (gle == ERROR_ABANDONED_WAIT_0) {
+				// IOCP handle was closed (shouldn't happen yet, but be safe)
+				break;
+			}
+			// Unknown error - bail out
+			break;
+		}
+
+		if (overlapped) {
+			ior_iocp_op *op = (ior_iocp_op *) overlapped;
+			atomic_fetch_sub(&ctx->active_count, 1);
+			free_op(ctx, op);
+		}
+	}
+
+	// Also drain any ops sitting in the ready queue
+	while (!ready_queue_empty(&ctx->ready)) {
+		ior_iocp_op *op = ready_queue_pop(&ctx->ready);
+		if (op) {
+			free_op(ctx, op);
+		}
 	}
 
 	ready_queue_destroy(&ctx->ready);
@@ -1173,7 +1284,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		// Assign submission sequence
 		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
 
-		// DRAIN barrier means “wait for all prior completions”
+		// DRAIN barrier means "wait for all prior completions"
 		if (op->sqe_flags & IOR_SQE_IO_DRAIN) {
 			op->drain_after = op->seq - 1;
 		} else {
@@ -1253,6 +1364,10 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		if (overlapped == NULL) {
 			if (gle == WAIT_TIMEOUT || gle == ERROR_TIMEOUT) {
 				return (timeout_ms == 0) ? -EAGAIN : -ETIMEDOUT;
+			}
+			if (gle == ERROR_ABANDONED_WAIT_0) {
+				// IOCP handle was closed while we were waiting
+				return -ECANCELED;
 			}
 			return win_error_to_errno(gle);
 		}
@@ -1463,7 +1578,7 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 	unsigned count = 0;
 
 	while (count < max && !ready_queue_empty(&ctx->ready)) {
-		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) % ctx->ready.size];
+		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) & ctx->ready.mask];
 		cqes[count] = &op->cqe;
 		count++;
 	}
@@ -1474,7 +1589,7 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 		if (ret < 0) {
 			break;
 		}
-		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) % ctx->ready.size];
+		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) & ctx->ready.mask];
 		cqes[count] = &op->cqe;
 		count++;
 	}

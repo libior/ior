@@ -25,10 +25,12 @@ static const ior_backend_ops *get_backend_ops(ior_backend_type backend)
 #ifdef IOR_HAVE_URING
 		case IOR_BACKEND_IOURING:
 			return &ior_uring_ops;
-#elif defined(IOR_HAVE_THREADS)
+#endif
+#ifdef IOR_HAVE_THREADS
 		case IOR_BACKEND_THREADS:
 			return &ior_threads_ops;
-#elif defined(IOR_HAVE_IOCP)
+#endif
+#ifdef IOR_HAVE_IOCP
 		case IOR_BACKEND_IOCP:
 			return &ior_iocp_ops;
 #endif
@@ -147,7 +149,7 @@ void ior_cq_advance(ior_ctx *ctx, unsigned nr)
 	}
 }
 
-/* Helper functions */
+/* Helper functions - work on opaque types via callbacks */
 void ior_prep_nop(ior_ctx *ctx, ior_sqe *sqe)
 {
 	if (ctx && sqe) {
@@ -155,7 +157,8 @@ void ior_prep_nop(ior_ctx *ctx, ior_sqe *sqe)
 	}
 }
 
-void ior_prep_read(ior_ctx *ctx, ior_sqe *sqe, int fd, void *buf, unsigned nbytes, uint64_t offset)
+void ior_prep_read(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, void *buf, unsigned nbytes, uint64_t offset)
 {
 	if (ctx && sqe) {
 		ctx->ops->prep_read(sqe, fd, buf, nbytes, offset);
@@ -163,14 +166,14 @@ void ior_prep_read(ior_ctx *ctx, ior_sqe *sqe, int fd, void *buf, unsigned nbyte
 }
 
 void ior_prep_write(
-		ior_ctx *ctx, ior_sqe *sqe, int fd, const void *buf, unsigned nbytes, uint64_t offset)
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const void *buf, unsigned nbytes, uint64_t offset)
 {
 	if (ctx && sqe) {
 		ctx->ops->prep_write(sqe, fd, buf, nbytes, offset);
 	}
 }
 
-void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in, int fd_out,
+void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in, ior_fd_t fd_out,
 		uint64_t off_out, unsigned nbytes, unsigned flags)
 {
 	if (ctx && sqe) {
