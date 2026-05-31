@@ -84,7 +84,14 @@ typedef enum {
 #define IOR_FEAT_POLL_ADD (1U << 3)
 #define IOR_FEAT_SQPOLL (1U << 4)
 
-#define IOR_SPLICE_OFF_NONE ((uint64_t) -1)
+/*
+ * Sentinel offset meaning "no offset / use the file description's current
+ * position." For read/write this selects read()/write() semantics over the
+ * positioned pread()/pwrite() (required for non-seekable fds such as sockets
+ * and pipes). For splice it marks an unused in/out offset. Equal to
+ * (uint64_t)-1, matching io_uring's convention for an absent offset.
+ */
+#define IOR_OFF_NONE ((uint64_t) -1)
 
 /* Forward declarations - OPAQUE TYPES */
 typedef struct ior_ctx ior_ctx;

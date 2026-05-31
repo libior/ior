@@ -403,8 +403,23 @@ static void ior_threads_pool_process_single_sqe(
 		case IOR_OP_READ: {
 			IOR_LOG_TRACE("read start: fd=%d, addr=%p, len=%u, flags=%lu", sqe->threads.fd,
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
-			ssize_t ret = pread(sqe->threads.fd, (void *) (uintptr_t) sqe->threads.addr,
-					sqe->threads.len, sqe->threads.off);
+			void *buf = (void *) (uintptr_t) sqe->threads.addr;
+			ssize_t ret;
+			/*
+			 * Use pread() for seekable fds (regular files). For non-seekable
+			 * fds (sockets, pipes, FIFOs) pread() fails with ESPIPE, so fall
+			 * back to read(), which uses the fd's own position. The explicit
+			 * IOR_OFF_NONE sentinel also selects read() directly. This matches
+			 * io_uring, whose read op works uniformly on files and sockets.
+			 */
+			if (sqe->threads.off == IOR_OFF_NONE) {
+				ret = read(sqe->threads.fd, buf, sqe->threads.len);
+			} else {
+				ret = pread(sqe->threads.fd, buf, sqe->threads.len, sqe->threads.off);
+				if (ret < 0 && errno == ESPIPE) {
+					ret = read(sqe->threads.fd, buf, sqe->threads.len);
+				}
+			}
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("read end: res=%d", cqe->threads.res);
 			break;
@@ -413,8 +428,18 @@ static void ior_threads_pool_process_single_sqe(
 		case IOR_OP_WRITE: {
 			IOR_LOG_TRACE("write start: fd=%d, addr=%p, len=%u, flags=%lu", sqe->threads.fd,
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
-			ssize_t ret = pwrite(sqe->threads.fd, (const void *) (uintptr_t) sqe->threads.addr,
-					sqe->threads.len, sqe->threads.off);
+			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
+			ssize_t ret;
+			/* See IOR_OP_READ above: pwrite() for seekable fds, write() for
+			 * non-seekable ones (sockets/pipes) or the IOR_OFF_NONE sentinel. */
+			if (sqe->threads.off == IOR_OFF_NONE) {
+				ret = write(sqe->threads.fd, buf, sqe->threads.len);
+			} else {
+				ret = pwrite(sqe->threads.fd, buf, sqe->threads.len, sqe->threads.off);
+				if (ret < 0 && errno == ESPIPE) {
+					ret = write(sqe->threads.fd, buf, sqe->threads.len);
+				}
+			}
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("write end: res=%d", cqe->threads.res);
 			break;
@@ -440,11 +465,10 @@ static void ior_threads_pool_process_single_sqe(
 
 		case IOR_OP_SPLICE: {
 			int fd_in = sqe->threads.splice_fd_in, fd_out = sqe->threads.fd;
-			loff_t *off_in = sqe->threads.splice_off_in == IOR_SPLICE_OFF_NONE
+			loff_t *off_in = sqe->threads.splice_off_in == IOR_OFF_NONE
 					? NULL
 					: (loff_t *) sqe->threads.splice_off_in;
-			loff_t *off_out
-					= sqe->threads.off == IOR_SPLICE_OFF_NONE ? NULL : (loff_t *) sqe->threads.off;
+			loff_t *off_out = sqe->threads.off == IOR_OFF_NONE ? NULL : (loff_t *) sqe->threads.off;
 			IOR_LOG_TRACE("splice start: fd_in=%d, off_in=%lu, fd_out=%d, off_out=%lu, size=%u, "
 						  "flags=%u",
 					fd_in, sqe->threads.splice_off_in, fd_out, sqe->threads.off, sqe->threads.len,
