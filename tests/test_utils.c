@@ -142,6 +142,28 @@ int test_fd_is_valid(ior_fd_t fd)
 	return fd != NULL && fd != INVALID_HANDLE_VALUE;
 }
 
+#ifdef IOR_HAVE_IOCP
+ior_fd_t test_open_fd_readonly(const char *path)
+{
+	HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		return IOR_TEST_INVALID_FD;
+	}
+	return h;
+}
+
+ior_fd_t test_open_fd_writeonly(const char *path)
+{
+	HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		return IOR_TEST_INVALID_FD;
+	}
+	return h;
+}
+#endif /* IOR_HAVE_IOCP */
+
 #else /* POSIX */
 
 char *create_temp_file(const char *content, size_t len)

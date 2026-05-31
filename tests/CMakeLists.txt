@@ -18,6 +18,7 @@ set(TESTS
     test_basic
     test_read_write
     test_timeout
+    test_edge
 )
 
 # Add test for splice only on Linux with splice support
@@ -85,4 +86,17 @@ if(IOR_HAVE_URING)
     apply_sanitizers(test_uring_backend)
     add_test(NAME test_uring_backend COMMAND test_uring_backend)
     set_tests_properties(test_uring_backend PROPERTIES TIMEOUT 30)
+endif()
+
+# IOCP backend tests (only if available, Windows)
+if(IOR_HAVE_IOCP)
+    add_executable(test_iocp_backend test_iocp_backend.c)
+    target_include_directories(test_iocp_backend PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_iocp_backend PRIVATE test_utils ior cmocka::cmocka)
+    apply_sanitizers(test_iocp_backend)
+    add_test(NAME test_iocp_backend COMMAND test_iocp_backend)
+    set_tests_properties(test_iocp_backend PROPERTIES TIMEOUT 30)
 endif()

@@ -59,4 +59,21 @@ ior_fd_t test_open_fd(const char *path);
 void test_close_fd(ior_fd_t fd);
 int test_fd_is_valid(ior_fd_t fd);
 
+#ifdef IOR_HAVE_IOCP
+/*
+ * IOCP-only helpers (Windows). These open overlapped handles with
+ * restricted access so that an issued ReadFile/WriteFile fails immediately
+ * with a non-IO_PENDING error, deterministically exercising the synthetic-
+ * completion path. No sockets involved.
+ */
+
+// Overlapped handle opened GENERIC_READ only -> writing to it fails
+// synchronously with ERROR_ACCESS_DENIED.
+ior_fd_t test_open_fd_readonly(const char *path);
+
+// Overlapped handle opened GENERIC_WRITE only -> reading from it fails
+// synchronously with ERROR_ACCESS_DENIED.
+ior_fd_t test_open_fd_writeonly(const char *path);
+#endif /* IOR_HAVE_IOCP */
+
 #endif /* TEST_UTILS_H */
