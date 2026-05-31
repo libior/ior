@@ -8,7 +8,7 @@ IOR provides a unified, io_uring-compatible API that works across different plat
 
 - **Linux**: Native io_uring support (when liburing is available), or thread pool emulation
 - **FreeBSD/OpenBSD/macOS**: Thread pool emulation with optimized event notification
-- **Windows**: IOCP backend (planned)
+- **Windows**: Native IOCP (I/O Completion Ports) backend
 
 The goal is to provide maximum performance on platforms with native async I/O support (like Linux's io_uring), while maintaining portability through efficient thread-based emulation on other platforms.
 
@@ -23,6 +23,7 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Ordering with `IOR_SQE_IO_DRAIN`
 - Thread pool emulation backend
 - Linux io_uring backend (with liburing)
+- Windows IOCP backend
 - eventfd-based notification (Linux/FreeBSD 13+)
 - Pipe-based notification fallback
 
@@ -31,7 +32,6 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Connect operations
 - Bind operations
 - Listen operations
-- Windows IOCP backend
 - Additional io_uring operations
 
 ## Building
@@ -57,7 +57,7 @@ sudo cmake --build build --target install
 
 - CMake 3.15+
 - C11 compiler (GCC, Clang, MSVC)
-- POSIX threads
+- POSIX threads (POSIX platforms)
 - **Optional:** liburing (Linux), cmocka (tests)
 
 ## Usage
@@ -133,6 +133,11 @@ int main() {
     return 0;
 }
 ```
+
+> **Windows note:** `ior_fd_t` is a `HANDLE` on Windows, not an `int`. The IOCP
+> backend issues overlapped `ReadFile`/`WriteFile`, so handles passed to
+> `ior_prep_read`/`ior_prep_write` must be opened with `FILE_FLAG_OVERLAPPED`
+> (e.g. via `CreateFile`). A CRT `_open()` descriptor will not work.
 
 ### Operation Chaining Example
 
@@ -289,8 +294,8 @@ All operations require passing the `ctx` parameter to route to the correct backe
 IOR automatically selects the best available backend:
 
 1. **io_uring** (Linux with liburing): Direct wrapper around liburing for maximum performance
-2. **Threads** (all platforms): Thread pool with lock-free ring buffers and efficient event notification
-3. **IOCP** (Windows, planned): Native Windows I/O Completion Ports
+2. **IOCP** (Windows): Native Windows I/O Completion Ports
+3. **Threads** (all platforms): Thread pool with lock-free ring buffers and efficient event notification
 
 ### Thread Backend Design
 
@@ -303,9 +308,30 @@ The thread pool backend uses:
 - Dynamic worker thread scaling
 - Efficient work distribution and completion posting
 
+### IOCP Backend Design
+
+The Windows IOCP backend maps the io_uring submit/complete model onto an I/O
+Completion Port:
+- A single completion port receives packets for all operations
+- Every operation - real I/O, NOPs, timers, errors, and cancellations - is
+  funneled into the port as a completion packet and reaped through one path,
+  so completions surface uniformly as CQEs
+- Operations Windows has no native equivalent for (NOP, timers) are delivered
+  via `PostQueuedCompletionStatus`
+- A dedicated timer thread backed by a min-heap services timeout operations
+- `IOR_SQE_IO_LINK` and `IOR_SQE_IO_DRAIN` are implemented in software on top
+  of the port, matching io_uring ordering semantics
+- Operations are drawn from a pre-allocated pool to avoid per-op allocation
+
+> **Note:** The IOCP backend currently supports file I/O. Socket operations
+> (accept/connect/send/recv) are part of Stage 2 and not yet wired up; plain
+> read/write on a socket handle goes through the file path and is not yet
+> recommended for sockets on Windows.
+
 ## Performance Considerations
 
 - **Linux with io_uring**: Near-zero overhead wrapper, performance matches native io_uring
+- **Windows IOCP**: Native completion-port I/O with a pre-allocated operation pool
 - **Thread backend**: Optimized for throughput with batching support and lock-free data structures
 - **Batch operations**: Use `ior_peek_batch_cqe()` and `ior_cq_advance()` for better efficiency when processing many completions
 - **Operation chaining**: Use `IOR_SQE_IO_LINK` to chain operations without intermediate submissions
