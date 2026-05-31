@@ -5,13 +5,25 @@ project(ior VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Set default build type if not specified
-if(NOT CMAKE_BUILD_TYPE)
+# Set default build type if not specified.
+# Note: for single-config generators (Make, Ninja) this picks the build type
+# at configure time. For multi-config generators (Visual Studio, Ninja Multi-Config)
+# it is ignored - the build type is chosen at build time via --config.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
 		"Choose the type of build: Debug Release RelWithDebInfo MinSizeRel" FORCE)
 endif()
 
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+if(CMAKE_BUILD_TYPE)
+	message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+else()
+	message(STATUS "Build type: multi-config (set with --config at build time)")
+endif()
+
+# Sanitizer options
+option(IOR_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(IOR_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+option(IOR_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 
 # Compiler flags per build type
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -35,14 +47,19 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 	# Minimum size release
 	set(CMAKE_C_FLAGS_MINSIZEREL "-Os -DNDEBUG")
 
-	# Add sanitizers option for debug builds
-	option(IOR_ENABLE_ASAN "Enable AddressSanitizer" OFF)
-	option(IOR_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
-	option(IOR_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
+	# MSVC warning flags. /W4 is roughly -Wall -Wextra; /permissive- tightens
+	# conformance. We deliberately do NOT use /WX (warnings-as-errors) by default.
+	set(WARNING_FLAGS
+		/W4
+		/permissive-
+	)
+
+	# Quiet down some noisy CRT-deprecation warnings for portable POSIX-ish code.
+	add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
-# Helper function to apply sanitizer flags to a target
-# Define unconditionally so it can always be called
+# Helper function to apply sanitizer flags to a target.
 function(apply_sanitizers target)
 	if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 		if(IOR_ENABLE_ASAN)
@@ -59,8 +76,24 @@ function(apply_sanitizers target)
 			target_compile_options(${target} PRIVATE -fsanitize=thread)
 			target_link_options(${target} PRIVATE -fsanitize=thread)
 		endif()
+	elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
+		# MSVC supports AddressSanitizer via /fsanitize=address.
+		# It does NOT support UBSan or TSan; those options are ignored here.
+		if(IOR_ENABLE_ASAN)
+			target_compile_options(${target} PRIVATE /fsanitize=address)
+			# MSVC ASan is incompatible with the /RTC runtime checks and with
+			# incremental linking; CMake's Debug config may set these, so clear
+			# RTC on this target.
+			target_compile_options(${target} PRIVATE /Od)
+		endif()
+		if(IOR_ENABLE_UBSAN)
+			message(WARNING "IOR_ENABLE_UBSAN has no effect with MSVC")
+		endif()
+		if(IOR_ENABLE_TSAN)
+			message(WARNING "IOR_ENABLE_TSAN has no effect with MSVC")
+		endif()
 	endif()
-	# For other compilers, this function does nothing
+	# For other compilers, this function does nothing.
 endfunction()
 
 # Build options
@@ -72,10 +105,10 @@ option(IOR_ENABLE_LOG "Enable logging system" OFF)
 
 if(IOR_ENABLE_LOG)
     set(IOR_HAVE_LOG TRUE)
-    set(IOR_LOG_LEVEL "2" CACHE STRING 
+    set(IOR_LOG_LEVEL "2" CACHE STRING
         "Default log level (0=TRACE, 1=DEBUG, 2=INFO, 3=WARN, 4=ERROR)")
     set_property(CACHE IOR_LOG_LEVEL PROPERTY STRINGS "0" "1" "2" "3" "4")
-    
+
     if(IOR_LOG_LEVEL EQUAL 0)
         set(IOR_LOG_LEVEL_NAME "TRACE")
     elseif(IOR_LOG_LEVEL EQUAL 1)
@@ -87,7 +120,7 @@ if(IOR_ENABLE_LOG)
     elseif(IOR_LOG_LEVEL EQUAL 4)
         set(IOR_LOG_LEVEL_NAME "ERROR")
     endif()
-    
+
     message(STATUS "Logging enabled (level: ${IOR_LOG_LEVEL_NAME})")
 else()
     message(STATUS "Logging disabled")
@@ -118,7 +151,7 @@ endif()
 include(CheckCSourceCompiles)
 check_c_source_compiles("
     #include <stdatomic.h>
-    int main() {
+    int main(void) {
         _Atomic int x = 0;
         atomic_store_explicit(&x, 1, memory_order_release);
         int y = atomic_load_explicit(&x, memory_order_acquire);
@@ -139,7 +172,7 @@ if(IOR_PLATFORM_LINUX)
         #define _GNU_SOURCE
         #include <fcntl.h>
         #include <unistd.h>
-        int main() {
+        int main(void) {
             splice(0, NULL, 1, NULL, 0, 0);
             return 0;
         }
@@ -169,7 +202,7 @@ if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
 
             check_c_source_compiles("
                 #include <liburing.h>
-                int main() {
+                int main(void) {
                     struct io_uring ring;
                     struct io_uring_params params = {0};
                     io_uring_queue_init_params(32, &ring, &params);
@@ -206,7 +239,7 @@ set(IOR_HAVE_EVENTFD FALSE)
 if((IOR_PLATFORM_LINUX OR IOR_PLATFORM_FREEBSD) AND NOT IOR_FORCE_PIPE)
     check_c_source_compiles("
         #include <sys/eventfd.h>
-        int main() {
+        int main(void) {
             int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
             return fd >= 0 ? 0 : 1;
         }
@@ -287,7 +320,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
     DESTINATION include/ior
 )
 
-# pkg-config file
+# pkg-config file (not meaningful on Windows/MSVC, but harmless to generate)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/ior.pc.in
     ${CMAKE_CURRENT_BINARY_DIR}/ior.pc

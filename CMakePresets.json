@@ -1,0 +1,157 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows (MSVC x64 + vcpkg)",
+      "description": "Auto-detects newest installed Visual Studio (2022 or 2026), x64, cmocka via vcpkg",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        }
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-vs2022",
+      "displayName": "Windows (force Visual Studio 2022)",
+      "description": "Pin the VS 2022 (v17) generator explicitly",
+      "inherits": "windows-msvc",
+      "generator": "Visual Studio 17 2022"
+    },
+    {
+      "name": "windows-vs2026",
+      "displayName": "Windows (force Visual Studio 2026)",
+      "description": "Pin the VS 2026 (v18) generator explicitly. Requires CMake 4.2 or later.",
+      "inherits": "windows-msvc",
+      "generator": "Visual Studio 18 2026"
+    },
+    {
+      "name": "windows-msvc-asan",
+      "displayName": "Windows (MSVC x64, AddressSanitizer)",
+      "inherits": "windows-msvc",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "IOR_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "linux-default",
+      "displayName": "Linux (default, io_uring if available)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-threads-debug",
+      "displayName": "Linux (thread backend, Debug + logging)",
+      "inherits": "linux-default",
+      "binaryDir": "${sourceDir}/build-threads",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IOR_FORCE_THREADS": "ON",
+        "IOR_ENABLE_LOG": "ON",
+        "IOR_LOG_LEVEL": "0"
+      }
+    },
+    {
+      "name": "linux-asan",
+      "displayName": "Linux (Debug + AddressSanitizer)",
+      "inherits": "linux-default",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IOR_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "linux-tsan",
+      "displayName": "Linux (Debug + ThreadSanitizer)",
+      "inherits": "linux-default",
+      "binaryDir": "${sourceDir}/build-tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IOR_ENABLE_TSAN": "ON"
+      }
+    },
+    {
+      "name": "macos-default",
+      "displayName": "macOS (thread backend)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-msvc-asan",
+      "configurePreset": "windows-msvc-asan",
+      "configuration": "Debug"
+    },
+    {
+      "name": "linux-default",
+      "configurePreset": "linux-default"
+    },
+    {
+      "name": "linux-threads-debug",
+      "configurePreset": "linux-threads-debug"
+    },
+    {
+      "name": "macos-default",
+      "configurePreset": "macos-default"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-default",
+      "configurePreset": "linux-default",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
