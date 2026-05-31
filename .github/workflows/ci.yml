@@ -162,8 +162,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The windows-msvc preset uses $env{VCPKG_ROOT} in its toolchain path.
+      # The runner preinstalls vcpkg and exposes its location as
+      # VCPKG_INSTALLATION_ROOT, but does not always set VCPKG_ROOT - and the
+      # MSVC dev-cmd step can drop env vars - so resolve and export it here,
+      # before configure, via GITHUB_ENV so later steps see it.
+      - name: Resolve VCPKG_ROOT
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root) { $root = "C:\vcpkg" }
+          echo "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Using VCPKG_ROOT=$root"
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # cmocka is pulled in via vcpkg (toolchain set by the preset).
+      # If your project vendors cmocka differently, adjust this step.
       - name: Install dependencies (vcpkg)
-        run: vcpkg install cmocka:x64-windows
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install cmocka:x64-windows
 
       - name: Configure
         run: cmake --preset windows-msvc
@@ -186,8 +208,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve VCPKG_ROOT
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root) { $root = "C:\vcpkg" }
+          echo "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Using VCPKG_ROOT=$root"
+
+      # Sets up the MSVC developer environment (PATH, VCToolsInstallDir, etc.)
+      # for all later steps. The ASan test preset relies on VCToolsInstallDir
+      # to locate clang_rt.asan_dynamic-x86_64.dll at test runtime.
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install dependencies (vcpkg)
-        run: vcpkg install cmocka:x64-windows
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install cmocka:x64-windows
 
       - name: Configure
         run: cmake --preset windows-msvc-asan
