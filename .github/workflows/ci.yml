@@ -155,3 +155,45 @@ jobs:
         run: ctest --test-dir build --output-on-failure
         env:
           ASAN_OPTIONS: halt_on_error=1
+
+  windows-iocp:
+    name: Windows IOCP (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (vcpkg)
+        run: vcpkg install cmocka:x64-windows
+
+      - name: Configure
+        run: cmake --preset windows-msvc
+
+      - name: Build
+        run: cmake --build --preset windows-msvc
+
+      - name: Test
+        run: ctest --preset windows-msvc --output-on-failure
+
+      - name: Print backend info
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter test_basic.exe build | Select-Object -First 1
+          if ($exe) { & $exe.FullName } else { Write-Host "test_basic.exe not found" }
+
+  windows-iocp-asan:
+    name: Windows IOCP + AddressSanitizer (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (vcpkg)
+        run: vcpkg install cmocka:x64-windows
+
+      - name: Configure
+        run: cmake --preset windows-msvc-asan
+
+      - name: Build
+        run: cmake --build --preset windows-msvc-asan
+
+      - name: Test
+        run: ctest --preset windows-msvc-asan --output-on-failure
