@@ -57,6 +57,15 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
 
 	# Quiet down some noisy CRT-deprecation warnings for portable POSIX-ish code.
 	add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+
+	# MSVC requires C11 mode plus an experimental flag to enable <stdatomic.h>.
+	# /std:c11 is normally implied by CMAKE_C_STANDARD=11, but the atomics header
+	# is gated behind /experimental:c11atomics (still required as of VS 2022/2026,
+	# because locking atomics are not yet complete). Without it, <stdatomic.h>
+	# fails to compile. Note: MSVC still defines __STDC_NO_ATOMICS__ even with the
+	# flag, so feature detection must compile a test program rather than check that
+	# macro (see the atomics check below).
+	add_compile_options(/experimental:c11atomics)
 endif()
 
 # Helper function to apply sanitizer flags to a target.
@@ -142,6 +151,13 @@ endif()
 # Check for C11 atomics (required)
 include(CheckIncludeFile)
 
+# On MSVC, <stdatomic.h> only compiles in C11 mode with the experimental flag.
+# These configure-time checks (check_include_file / check_c_source_compiles) do
+# not see add_compile_options(), so set the flags explicitly for them here.
+if(CMAKE_C_COMPILER_ID MATCHES "MSVC")
+    set(CMAKE_REQUIRED_FLAGS "/std:c11 /experimental:c11atomics")
+endif()
+
 check_include_file("stdatomic.h" HAVE_STDATOMIC_H)
 if(NOT HAVE_STDATOMIC_H)
     message(FATAL_ERROR "stdatomic.h not found - C11 atomics are required")
@@ -149,6 +165,7 @@ endif()
 
 # Verify atomics actually work
 include(CheckCSourceCompiles)
+
 check_c_source_compiles("
     #include <stdatomic.h>
     int main(void) {
@@ -158,6 +175,10 @@ check_c_source_compiles("
         return y;
     }
 " C11_ATOMICS_WORK)
+
+if(CMAKE_C_COMPILER_ID MATCHES "MSVC")
+    unset(CMAKE_REQUIRED_FLAGS)
+endif()
 
 if(NOT C11_ATOMICS_WORK)
     message(FATAL_ERROR "C11 atomics don't work - check your compiler")
