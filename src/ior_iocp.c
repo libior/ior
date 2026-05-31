@@ -109,8 +109,15 @@ typedef struct timer_mgr {
 	uint32_t heap_cap;
 } timer_mgr;
 
-/* QPC frequency, initialized once during backend init */
-static LARGE_INTEGER g_qpc_freq;
+/* QPC frequency, initialized once during backend init.
+ *
+ * Stored as an atomic so that the publishing thread's write is observed with
+ * release semantics and reader threads acquire it. A non-zero value signals
+ * "initialized"; QueryPerformanceFrequency never returns 0 on supported
+ * platforms (XP+), so 0 is a safe sentinel. This matters on weakly-ordered
+ * architectures (e.g. Windows on ARM64) where a plain store could be observed
+ * out of order relative to the init flag. */
+static _Atomic int64_t g_qpc_freq = 0;
 static LONG g_qpc_freq_init = 0; // 0 = not done, 1 = done
 
 /* IOCP backend context */
@@ -640,14 +647,17 @@ static void qpc_freq_init(void)
 	/*
 	 * Thread-safe one-shot initialization of g_qpc_freq.
 	 * Uses InterlockedCompareExchange to ensure exactly one thread
-	 * calls QueryPerformanceFrequency.
+	 * calls QueryPerformanceFrequency. The frequency is published with
+	 * release semantics; waiters spin on an acquire load so the value is
+	 * fully visible before use (correct even on weakly-ordered CPUs).
 	 */
 	if (InterlockedCompareExchange(&g_qpc_freq_init, 1, 0) == 0) {
-		QueryPerformanceFrequency(&g_qpc_freq);
-		MemoryBarrier();
+		LARGE_INTEGER freq;
+		QueryPerformanceFrequency(&freq);
+		atomic_store_explicit(&g_qpc_freq, (int64_t) freq.QuadPart, memory_order_release);
 	} else {
 		// Another thread is initializing or has finished; spin until done.
-		while (g_qpc_freq.QuadPart == 0) {
+		while (atomic_load_explicit(&g_qpc_freq, memory_order_acquire) == 0) {
 			YieldProcessor();
 		}
 	}
@@ -659,7 +669,7 @@ static uint64_t qpc_now_ns(void)
 	QueryPerformanceCounter(&counter);
 
 	uint64_t c = (uint64_t) counter.QuadPart;
-	uint64_t f = (uint64_t) g_qpc_freq.QuadPart;
+	uint64_t f = (uint64_t) atomic_load_explicit(&g_qpc_freq, memory_order_acquire);
 
 	uint64_t sec = c / f;
 	uint64_t rem = c % f;
@@ -1444,6 +1454,13 @@ static int ior_iocp_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 
 	while (ctx->ready.count < wait_nr) {
 		int ret = dequeue_one_completion(ctx, INFINITE);
+		if (ret == -EAGAIN) {
+			// A stray NULL completion packet was dequeued (e.g. an external
+			// PostQueuedCompletionStatus with NULL overlapped). Under an
+			// INFINITE wait this is not a terminal condition - real
+			// completions are still pending, so keep waiting.
+			continue;
+		}
 		if (ret < 0) {
 			return ret;
 		}
@@ -1547,16 +1564,48 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 
 	ior_iocp_op *head_op = ready_queue_peek(&ctx->ready);
 
-	if (head_op != op) {
-		IOR_LOG_ERROR("cqe_seen called out of order - expected %p, got %p", (void *) head_op,
-				(void *) op);
-#ifndef NDEBUG
-		abort();
-#endif
+	if (head_op == op) {
+		// Fast path: in-order consumption, matching the common io_uring usage.
+		ready_queue_pop(&ctx->ready);
+		free_op(ctx, op);
 		return;
 	}
 
-	ready_queue_pop(&ctx->ready);
+	/*
+	 * Out-of-order cqe_seen. This happens if the caller peeked a batch (via
+	 * peek_batch_cqe) and then marked CQEs seen individually rather than using
+	 * cq_advance. Rather than abort(), locate the entry in the ready queue and
+	 * remove it in place, compacting the ring. This keeps a misusing caller
+	 * alive with consistent behaviour across debug and release builds.
+	 */
+	ready_queue *q = &ctx->ready;
+	uint32_t found = UINT32_MAX;
+	for (uint32_t i = 0; i < q->count; i++) {
+		uint32_t idx = (q->head + i) & q->mask;
+		if (q->ops[idx] == op) {
+			found = i;
+			break;
+		}
+	}
+
+	if (found == UINT32_MAX) {
+		IOR_LOG_ERROR("cqe_seen called for CQE not in ready queue: %p", (void *) op);
+		return;
+	}
+
+	IOR_LOG_WARN("cqe_seen called out of order (offset %u of %u); removing in place", found,
+			q->count);
+
+	// Shift later entries down by one to fill the gap.
+	for (uint32_t i = found; i + 1 < q->count; i++) {
+		uint32_t cur = (q->head + i) & q->mask;
+		uint32_t nxt = (q->head + i + 1) & q->mask;
+		q->ops[cur] = q->ops[nxt];
+	}
+
+	q->tail = (q->tail - 1) & q->mask;
+	q->count--;
+
 	free_op(ctx, op);
 }
 
