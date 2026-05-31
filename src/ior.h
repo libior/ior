@@ -12,6 +12,17 @@ extern "C" {
 
 /* Platform-specific file descriptor type */
 #ifdef _WIN32
+/*
+ * Define WIN32_LEAN_AND_MEAN before windows.h so it does not implicitly
+ * include the legacy winsock.h (Winsock 1.1). That header conflicts with
+ * winsock2.h, so without this guard any consumer that uses ior.h together
+ * with winsock2.h would get a flood of struct/function redefinition errors
+ * unless they carefully control include order. With this guard, including
+ * ior.h before or after winsock2.h both work.
+ */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 typedef HANDLE ior_fd_t;
 #define IOR_INVALID_FD INVALID_HANDLE_VALUE
@@ -137,4 +148,4 @@ uint32_t ior_get_features(ior_ctx *ctx);
 }
 #endif
 
-#endif /* IOR_H */
+#endif /* IOR_H */`

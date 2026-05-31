@@ -1,11 +1,26 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+
+/*
+ * On Windows, winsock2.h MUST be included before windows.h. test_utils.h
+ * transitively includes windows.h (via ior.h), so we pull in Winsock here,
+ * first, and define WIN32_LEAN_AND_MEAN so the later windows.h does not drag
+ * in the legacy winsock.h (1.1) that conflicts with winsock2.h.
+ */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#endif
+
 #include "test_utils.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #endif
 
 int setup_ior_ctx(void **state)
@@ -164,6 +179,93 @@ ior_fd_t test_open_fd_writeonly(const char *path)
 }
 #endif /* IOR_HAVE_IOCP */
 
+/*
+ * Windows has no socketpair(). Build a connected loopback TCP pair:
+ *   - create a listener bound to 127.0.0.1:0 (ephemeral port)
+ *   - read back the assigned port
+ *   - create a client socket and connect() to it (blocking)
+ *   - accept() the connection
+ *   - return {accepted, client}
+ *
+ * Sockets are created with WSASocketW(..., WSA_FLAG_OVERLAPPED) so the IOCP
+ * backend can issue overlapped reads/writes against the returned HANDLEs.
+ * ior_fd_t is HANDLE on Windows; a SOCKET is castable to HANDLE for this use.
+ *
+ * WSAStartup is performed once per call and matched by WSACleanup only on the
+ * failure paths; on success the Winsock refcount is intentionally left raised
+ * for the lifetime of the returned sockets (closed by the caller). A matching
+ * WSAStartup/WSACleanup balance per process is the caller-of-record's job; for
+ * a short-lived test process leaving it raised is harmless.
+ */
+int test_make_socketpair(ior_fd_t fds[2])
+{
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+		return -EIO;
+	}
+
+	SOCKET listener = INVALID_SOCKET, client = INVALID_SOCKET, accepted = INVALID_SOCKET;
+	struct sockaddr_in addr;
+	int addr_len = sizeof(addr);
+
+	listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (listener == INVALID_SOCKET) {
+		goto fail;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = 0; // ephemeral
+
+	if (bind(listener, (struct sockaddr *) &addr, sizeof(addr)) == SOCKET_ERROR) {
+		goto fail;
+	}
+	if (listen(listener, 1) == SOCKET_ERROR) {
+		goto fail;
+	}
+	if (getsockname(listener, (struct sockaddr *) &addr, &addr_len) == SOCKET_ERROR) {
+		goto fail;
+	}
+
+	// Overlapped client socket so IOCP can do async I/O on it.
+	client = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	if (client == INVALID_SOCKET) {
+		goto fail;
+	}
+	if (connect(client, (struct sockaddr *) &addr, sizeof(addr)) == SOCKET_ERROR) {
+		goto fail;
+	}
+
+	accepted = accept(listener, NULL, NULL);
+	if (accepted == INVALID_SOCKET) {
+		goto fail;
+	}
+
+	// The accepted socket inherits the listener's properties but is not
+	// overlapped-flagged by default on all stacks; re-create coverage is not
+	// needed because accept() on an overlapped listener yields a socket usable
+	// with overlapped I/O. The listener itself is no longer needed.
+	closesocket(listener);
+
+	fds[0] = (ior_fd_t) accepted;
+	fds[1] = (ior_fd_t) client;
+	return 0;
+
+fail:
+	if (accepted != INVALID_SOCKET) {
+		closesocket(accepted);
+	}
+	if (client != INVALID_SOCKET) {
+		closesocket(client);
+	}
+	if (listener != INVALID_SOCKET) {
+		closesocket(listener);
+	}
+	WSACleanup();
+	return -EIO;
+}
+
 #else /* POSIX */
 
 char *create_temp_file(const char *content, size_t len)
@@ -209,6 +311,17 @@ void test_close_fd(ior_fd_t fd)
 int test_fd_is_valid(ior_fd_t fd)
 {
 	return fd >= 0;
+}
+
+int test_make_socketpair(ior_fd_t fds[2])
+{
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+		return -errno;
+	}
+	fds[0] = sv[0];
+	fds[1] = sv[1];
+	return 0;
 }
 
 #endif /* _WIN32 */

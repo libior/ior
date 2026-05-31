@@ -59,6 +59,20 @@ ior_fd_t test_open_fd(const char *path);
 void test_close_fd(ior_fd_t fd);
 int test_fd_is_valid(ior_fd_t fd);
 
+/*
+ * Create a connected pair of stream sockets usable by the active backend.
+ *
+ * fds[0] and fds[1] are two ends of a connected, blocking-by-default stream
+ * socket: bytes written to one are readable from the other. On POSIX this is
+ * socketpair(AF_UNIX). On Windows there is no socketpair(), so this builds a
+ * loopback AF_INET TCP connection; the sockets are created with
+ * WSA_FLAG_OVERLAPPED so the IOCP backend can issue overlapped I/O on them.
+ *
+ * Returns 0 on success, negative errno-style on failure. On success the
+ * caller must close both ends with test_close_fd().
+ */
+int test_make_socketpair(ior_fd_t fds[2]);
+
 #ifdef IOR_HAVE_IOCP
 /*
  * IOCP-only helpers (Windows). These open overlapped handles with

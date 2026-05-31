@@ -11,6 +11,10 @@ target_include_directories(test_utils
         ${CMAKE_BINARY_DIR}
 )
 target_link_libraries(test_utils PUBLIC ior cmocka::cmocka)
+# Windows: the loopback socketpair helper needs Winsock.
+if(WIN32)
+    target_link_libraries(test_utils PUBLIC ws2_32)
+endif()
 apply_sanitizers(test_utils)
 
 # Test executables - common tests
@@ -19,6 +23,7 @@ set(TESTS
     test_read_write
     test_timeout
     test_edge
+    test_socket
 )
 
 # Add test for splice only on Linux with splice support
