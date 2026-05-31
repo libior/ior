@@ -1594,8 +1594,8 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 		return;
 	}
 
-	IOR_LOG_WARN("cqe_seen called out of order (offset %u of %u); removing in place", found,
-			q->count);
+	IOR_LOG_WARN(
+			"cqe_seen called out of order (offset %u of %u); removing in place", found, q->count);
 
 	// Shift later entries down by one to fill the gap.
 	for (uint32_t i = found; i + 1 < q->count; i++) {

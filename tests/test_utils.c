@@ -105,8 +105,8 @@ char *create_temp_file(const char *content, size_t len)
 
 	// GetTempFileNameA created an empty file. Write the content if any.
 	if (content && len > 0) {
-		HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, TRUNCATE_EXISTING,
-				FILE_ATTRIBUTE_NORMAL, NULL);
+		HANDLE h = CreateFileA(
+				path, GENERIC_WRITE, 0, NULL, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (h == INVALID_HANDLE_VALUE) {
 			DeleteFileA(path);
 			return NULL;
@@ -136,9 +136,8 @@ ior_fd_t test_open_fd(const char *path)
 {
 	// The IOCP backend issues overlapped ReadFile/WriteFile, so the handle
 	// must be opened with FILE_FLAG_OVERLAPPED.
-	HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
-			FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+	HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 	if (h == INVALID_HANDLE_VALUE) {
 		return IOR_TEST_INVALID_FD;
 	}

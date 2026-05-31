@@ -417,8 +417,7 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_peek_empty, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_nop_roundtrip, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_submit_empty, setup_ior_ctx, teardown_ior_ctx),
-		cmocka_unit_test_setup_teardown(
-				test_submit_and_wait_zero, setup_ior_ctx, teardown_ior_ctx),
+		cmocka_unit_test_setup_teardown(test_submit_and_wait_zero, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(
 				test_batch_reap_and_advance, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_cq_advance_zero, setup_ior_ctx, teardown_ior_ctx),

@@ -402,8 +402,7 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_drain_is_last, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_timer_fires, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_timer_heap_order, iocp_setup, iocp_teardown),
-		cmocka_unit_test_setup_teardown(
-				test_sync_completion_accounting, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_sync_completion_accounting, iocp_setup, iocp_teardown),
 		cmocka_unit_test(test_teardown_inflight),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
