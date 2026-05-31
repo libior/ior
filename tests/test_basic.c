@@ -43,7 +43,7 @@ static void test_sqe_operations(void **state)
 
 	// Test prep_nop
 	ior_prep_nop(ts->ctx, sqe);
-	ior_sqe_set_data(ts->ctx, sqe, (void *) 0xDEADBEEF);
+	ior_sqe_set_data(ts->ctx, sqe, (void *) (uintptr_t) 0xDEADBEEF);
 
 	int ret = ior_submit(ts->ctx);
 	assert_true(ret >= 0);

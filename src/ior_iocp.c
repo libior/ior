@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 
 // ETIME is used for timer expiration (matches io_uring semantics)
 #ifndef ETIME
