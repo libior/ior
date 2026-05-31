@@ -147,6 +147,14 @@
       }
     },
     {
+      "name": "windows-msvc-asan",
+      "configurePreset": "windows-msvc-asan",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "linux-default",
       "configurePreset": "linux-default",
       "output": {

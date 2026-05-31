@@ -92,8 +92,12 @@ function(apply_sanitizers target)
 			target_compile_options(${target} PRIVATE /fsanitize=address)
 			# MSVC ASan is incompatible with the /RTC runtime checks and with
 			# incremental linking; CMake's Debug config may set these, so clear
-			# RTC on this target.
+			# RTC on this target and force /Od.
 			target_compile_options(${target} PRIVATE /Od)
+			# Incremental linking is silently ignored when ASAN metadata is
+			# present (warning LNK4300). Disable it explicitly to keep the link
+			# output clean.
+			target_link_options(${target} PRIVATE /INCREMENTAL:NO)
 		endif()
 		if(IOR_ENABLE_UBSAN)
 			message(WARNING "IOR_ENABLE_UBSAN has no effect with MSVC")
