@@ -162,31 +162,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The windows-msvc preset uses $env{VCPKG_ROOT} in its toolchain path.
-      # The runner preinstalls vcpkg and exposes its location as
-      # VCPKG_INSTALLATION_ROOT, but does not always set VCPKG_ROOT - and the
-      # MSVC dev-cmd step can drop env vars - so resolve and export it here,
-      # before configure, via GITHUB_ENV so later steps see it.
-      - name: Resolve VCPKG_ROOT
-        shell: pwsh
-        run: |
-          $root = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $root) { $root = "C:\vcpkg" }
-          echo "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Using VCPKG_ROOT=$root"
-
+      # Sets up the MSVC developer environment and sets VCPKG_ROOT to the
+      # VS-bundled vcpkg, which the windows-msvc preset's toolchain path uses.
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # cmocka is pulled in via vcpkg (toolchain set by the preset).
-      # If your project vendors cmocka differently, adjust this step.
-      - name: Install dependencies (vcpkg)
-        shell: pwsh
-        run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install cmocka:x64-windows
-
+      # No explicit "vcpkg install" step: cmocka is declared in vcpkg.json and
+      # installed automatically at configure time via the vcpkg toolchain
+      # (manifest mode). This works regardless of which vcpkg distribution
+      # VCPKG_ROOT points at.
       - name: Configure
         run: cmake --preset windows-msvc
 
@@ -208,27 +194,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve VCPKG_ROOT
-        shell: pwsh
-        run: |
-          $root = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $root) { $root = "C:\vcpkg" }
-          echo "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Using VCPKG_ROOT=$root"
-
-      # Sets up the MSVC developer environment (PATH, VCToolsInstallDir, etc.)
-      # for all later steps. The ASan test preset relies on VCToolsInstallDir
-      # to locate clang_rt.asan_dynamic-x86_64.dll at test runtime.
+      # Sets up the MSVC developer environment (PATH, VCToolsInstallDir,
+      # VCPKG_ROOT, etc.) for all later steps. The ASan test preset relies on
+      # VCToolsInstallDir to locate clang_rt.asan_dynamic-x86_64.dll at test
+      # runtime; the preset toolchain path uses VCPKG_ROOT.
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Install dependencies (vcpkg)
-        shell: pwsh
-        run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install cmocka:x64-windows
-
+      # cmocka comes from vcpkg.json at configure time (manifest mode).
       - name: Configure
         run: cmake --preset windows-msvc-asan
 
