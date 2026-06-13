@@ -261,7 +261,22 @@ static void ior_uring_backend_sqe_set_data(ior_sqe *sqe, void *data)
 static void ior_uring_backend_sqe_set_flags(ior_sqe *sqe, uint8_t flags)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
-	s->flags = flags;
+
+	// Map ior's public SQE flags to liburing's IOSQE_* flags.
+	uint8_t uflags = 0;
+	if (flags & IOR_SQE_FIXED_FILE) {
+		uflags |= IOSQE_FIXED_FILE;
+	}
+	if (flags & IOR_SQE_IO_DRAIN) {
+		uflags |= IOSQE_IO_DRAIN;
+	}
+	if (flags & IOR_SQE_IO_LINK) {
+		uflags |= IOSQE_IO_LINK;
+	}
+	if (flags & IOR_SQE_ASYNC) {
+		uflags |= IOSQE_ASYNC;
+	}
+	s->flags = uflags;
 }
 
 /* CQE accessors */
