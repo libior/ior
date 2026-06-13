@@ -691,8 +691,7 @@ static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	op->wsabuf.buf = (CHAR *) op->buf;
 	op->wsabuf.len = op->len;
 
-	int rc = WSASend(
-			(SOCKET) op->fd, &op->wsabuf, 1, NULL, op->sock_flags, &op->overlapped, NULL);
+	int rc = WSASend((SOCKET) op->fd, &op->wsabuf, 1, NULL, op->sock_flags, &op->overlapped, NULL);
 	if (rc == 0) {
 		// Synchronous success: completion packet will still be posted to IOCP
 		atomic_fetch_add(&ctx->active_count, 1);
@@ -720,8 +719,7 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	// sock_flags is an in/out parameter for WSARecv and must remain valid for
 	// the whole async operation, hence it lives in the op.
-	int rc = WSARecv(
-			(SOCKET) op->fd, &op->wsabuf, 1, NULL, &op->sock_flags, &op->overlapped, NULL);
+	int rc = WSARecv((SOCKET) op->fd, &op->wsabuf, 1, NULL, &op->sock_flags, &op->overlapped, NULL);
 	if (rc == 0) {
 		// Synchronous success: completion packet will still be posted to IOCP
 		atomic_fetch_add(&ctx->active_count, 1);
@@ -1662,8 +1660,8 @@ static int ior_iocp_backend_wait_cqe_timeout(
 		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
 			return -EINVAL;
 		}
-		deadline_ns = qpc_now_ns()
-				+ (uint64_t) timeout->tv_sec * 1000000000ULL + (uint64_t) timeout->tv_nsec;
+		deadline_ns = qpc_now_ns() + (uint64_t) timeout->tv_sec * 1000000000ULL
+				+ (uint64_t) timeout->tv_nsec;
 		has_deadline = 1;
 	}
 

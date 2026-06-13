@@ -187,8 +187,8 @@ int main(void)
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test_setup_teardown(
 				test_concurrency_nop_fanout, setup_concurrency_ctx, teardown_concurrency_ctx),
-		cmocka_unit_test_setup_teardown(test_concurrency_fanout_with_timers,
-				setup_concurrency_ctx, teardown_concurrency_ctx),
+		cmocka_unit_test_setup_teardown(test_concurrency_fanout_with_timers, setup_concurrency_ctx,
+				teardown_concurrency_ctx),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

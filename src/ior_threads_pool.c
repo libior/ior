@@ -542,7 +542,8 @@ static void ior_threads_pool_process_single_sqe(
 
 		case IOR_OP_SEND: {
 			IOR_LOG_TRACE("send start: fd=%d, addr=%p, len=%u, flags=%u", sqe->threads.fd,
-					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.rw_flags);
+					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
+					sqe->threads.rw_flags);
 			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
 			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
@@ -552,7 +553,8 @@ static void ior_threads_pool_process_single_sqe(
 
 		case IOR_OP_RECV: {
 			IOR_LOG_TRACE("recv start: fd=%d, addr=%p, len=%u, flags=%u", sqe->threads.fd,
-					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.rw_flags);
+					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
+					sqe->threads.rw_flags);
 			void *buf = (void *) (uintptr_t) sqe->threads.addr;
 			ssize_t ret = recv(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
@@ -691,8 +693,7 @@ static int ior_threads_pool_timer_push(ior_threads_pool *pool, ior_threads_pool_
 {
 	if (pool->timer_heap_len >= pool->timer_heap_cap) {
 		uint32_t new_cap = pool->timer_heap_cap * 2;
-		ior_threads_pool_timer *new_heap
-				= realloc(pool->timer_heap, new_cap * sizeof(*new_heap));
+		ior_threads_pool_timer *new_heap = realloc(pool->timer_heap, new_cap * sizeof(*new_heap));
 		if (!new_heap) {
 			return -ENOMEM;
 		}
@@ -736,8 +737,8 @@ static void ior_threads_pool_arm_timer(
 
 	if (!err) {
 		ior_threads_pool_timer timer = {
-			.deadline_ns = ior_threads_pool_monotonic_ns()
-					+ (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec,
+			.deadline_ns = ior_threads_pool_monotonic_ns() + (uint64_t) ts->tv_sec * 1000000000ULL
+					+ (uint64_t) ts->tv_nsec,
 			.position = position,
 			.user_data = sqe->threads.user_data,
 		};
@@ -796,8 +797,8 @@ static void *ior_threads_pool_timer_thread_func(void *arg)
 			uint64_t remaining_ns = deadline - now;
 			struct timespec rt;
 			clock_gettime(CLOCK_REALTIME, &rt);
-			uint64_t abs_ns = (uint64_t) rt.tv_sec * 1000000000ULL + (uint64_t) rt.tv_nsec
-					+ remaining_ns;
+			uint64_t abs_ns
+					= (uint64_t) rt.tv_sec * 1000000000ULL + (uint64_t) rt.tv_nsec + remaining_ns;
 			struct timespec until = {
 				.tv_sec = (time_t) (abs_ns / 1000000000ULL),
 				.tv_nsec = (long) (abs_ns % 1000000000ULL),
