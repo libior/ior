@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #ifndef __linux__
 typedef off_t loff_t;
@@ -25,6 +26,9 @@ static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static int ior_threads_pool_try_create_thread(ior_threads_pool *pool);
+static void *ior_threads_pool_timer_thread_func(void *arg);
+static void ior_threads_pool_arm_timer(
+		ior_threads_pool *pool, const ior_sqe *sqe, uint64_t position);
 #ifndef IOR_HAVE_SPLICE
 static ssize_t ior_threads_pool_emulate_splice(
 		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);
@@ -83,6 +87,48 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	pool->threads = NULL;
 	pool->num_threads_current = 0;
 	pool->num_threads_idle = 0;
+
+	// Timer manager: small min-heap plus a dedicated thread.
+	pool->timer_thread_started = 0;
+	pool->timer_heap = NULL;
+	pool->timer_heap_len = 0;
+	pool->timer_heap_cap = 16;
+
+	if (pthread_mutex_init(&pool->timer_lock, NULL) != 0) {
+		pthread_cond_destroy(&pool->work_cond);
+		pthread_mutex_destroy(&pool->pool_lock);
+		free(pool);
+		return NULL;
+	}
+
+	if (pthread_cond_init(&pool->timer_cond, NULL) != 0) {
+		pthread_mutex_destroy(&pool->timer_lock);
+		pthread_cond_destroy(&pool->work_cond);
+		pthread_mutex_destroy(&pool->pool_lock);
+		free(pool);
+		return NULL;
+	}
+
+	pool->timer_heap = calloc(pool->timer_heap_cap, sizeof(*pool->timer_heap));
+	if (!pool->timer_heap) {
+		pthread_cond_destroy(&pool->timer_cond);
+		pthread_mutex_destroy(&pool->timer_lock);
+		pthread_cond_destroy(&pool->work_cond);
+		pthread_mutex_destroy(&pool->pool_lock);
+		free(pool);
+		return NULL;
+	}
+
+	if (pthread_create(&pool->timer_thread, NULL, ior_threads_pool_timer_thread_func, pool) != 0) {
+		free(pool->timer_heap);
+		pthread_cond_destroy(&pool->timer_cond);
+		pthread_mutex_destroy(&pool->timer_lock);
+		pthread_cond_destroy(&pool->work_cond);
+		pthread_mutex_destroy(&pool->pool_lock);
+		free(pool);
+		return NULL;
+	}
+	pool->timer_thread_started = 1;
 
 	// Create minimum number of threads if specified
 	pthread_attr_t attr;
@@ -160,6 +206,20 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 
 	// Signal shutdown
 	atomic_store(&pool->shutdown, 1);
+
+	// Wake the timer thread so it observes shutdown immediately rather than
+	// sleeping out a pending deadline, then join it. Pending timers are
+	// dropped without posting completions (the queue is being torn down).
+	if (pool->timer_thread_started) {
+		pthread_mutex_lock(&pool->timer_lock);
+		pthread_cond_signal(&pool->timer_cond);
+		pthread_mutex_unlock(&pool->timer_lock);
+		pthread_join(pool->timer_thread, NULL);
+	}
+	pthread_cond_destroy(&pool->timer_cond);
+	pthread_mutex_destroy(&pool->timer_lock);
+	free(pool->timer_heap);
+	pool->timer_heap = NULL;
 
 	// Wake all threads
 	pthread_mutex_lock(&pool->pool_lock);
@@ -355,6 +415,17 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 			ior_threads_ring_wait_until_head(&ctx->sq_ring, current_position);
 		}
 
+		// Timers do not execute on a worker thread. Hand the timer off to the
+		// dedicated timer thread, which posts the completion and releases this
+		// SQ slot when the deadline fires (or drops it on shutdown). A timeout
+		// completes with -ETIME, which would break a LINK chain regardless, so
+		// we stop here; any following linked SQEs are picked up independently,
+		// matching the previous inline behavior.
+		if (sqe_copy.threads.opcode == IOR_OP_TIMER) {
+			ior_threads_pool_arm_timer(pool, &sqe_copy, current_position);
+			break;
+		}
+
 		// Process this SQE
 		ior_cqe cqe;
 		ior_threads_pool_process_single_sqe(pool, &sqe_copy, &cqe);
@@ -443,24 +514,6 @@ static void ior_threads_pool_process_single_sqe(
 			}
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("write end: res=%d", cqe->threads.res);
-			break;
-		}
-
-		case IOR_OP_TIMER: {
-			ior_timespec *ts = (ior_timespec *) (uintptr_t) sqe->threads.addr;
-			if (ts) {
-				struct timespec sts = {
-					.tv_sec = ts->tv_sec,
-					.tv_nsec = ts->tv_nsec,
-				};
-				IOR_LOG_TRACE("timer start: sec=%ld, nsec=%lld", ts->tv_sec, ts->tv_nsec);
-				nanosleep(&sts, NULL);
-				IOR_LOG_TRACE("timer end: res=%d", -ETIME);
-				cqe->threads.res = -ETIME;
-			} else {
-				IOR_LOG_TRACE("timer failed: res=%d", -EINVAL);
-				cqe->threads.res = -EINVAL;
-			}
 			break;
 		}
 
@@ -579,6 +632,199 @@ static int ior_threads_pool_try_create_thread(ior_threads_pool *pool)
 	pool->num_threads_idle++;
 
 	return 0;
+}
+
+// ===== Timer Thread =====
+
+static uint64_t ior_threads_pool_monotonic_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+/* Min-heap keyed on deadline_ns. All helpers run under pool->timer_lock. */
+static void ior_threads_pool_timer_swap(ior_threads_pool *pool, uint32_t i, uint32_t j)
+{
+	ior_threads_pool_timer tmp = pool->timer_heap[i];
+	pool->timer_heap[i] = pool->timer_heap[j];
+	pool->timer_heap[j] = tmp;
+}
+
+static void ior_threads_pool_timer_sift_up(ior_threads_pool *pool, uint32_t idx)
+{
+	while (idx > 0) {
+		uint32_t parent = (idx - 1) / 2;
+		if (pool->timer_heap[idx].deadline_ns >= pool->timer_heap[parent].deadline_ns) {
+			break;
+		}
+		ior_threads_pool_timer_swap(pool, idx, parent);
+		idx = parent;
+	}
+}
+
+static void ior_threads_pool_timer_sift_down(ior_threads_pool *pool, uint32_t idx)
+{
+	uint32_t len = pool->timer_heap_len;
+	while (1) {
+		uint32_t left = 2 * idx + 1;
+		uint32_t right = 2 * idx + 2;
+		uint32_t smallest = idx;
+
+		if (left < len
+				&& pool->timer_heap[left].deadline_ns < pool->timer_heap[smallest].deadline_ns) {
+			smallest = left;
+		}
+		if (right < len
+				&& pool->timer_heap[right].deadline_ns < pool->timer_heap[smallest].deadline_ns) {
+			smallest = right;
+		}
+		if (smallest == idx) {
+			break;
+		}
+		ior_threads_pool_timer_swap(pool, idx, smallest);
+		idx = smallest;
+	}
+}
+
+static int ior_threads_pool_timer_push(ior_threads_pool *pool, ior_threads_pool_timer timer)
+{
+	if (pool->timer_heap_len >= pool->timer_heap_cap) {
+		uint32_t new_cap = pool->timer_heap_cap * 2;
+		ior_threads_pool_timer *new_heap
+				= realloc(pool->timer_heap, new_cap * sizeof(*new_heap));
+		if (!new_heap) {
+			return -ENOMEM;
+		}
+		pool->timer_heap = new_heap;
+		pool->timer_heap_cap = new_cap;
+	}
+
+	pool->timer_heap[pool->timer_heap_len] = timer;
+	ior_threads_pool_timer_sift_up(pool, pool->timer_heap_len);
+	pool->timer_heap_len++;
+	return 0;
+}
+
+static ior_threads_pool_timer ior_threads_pool_timer_pop(ior_threads_pool *pool)
+{
+	ior_threads_pool_timer top = pool->timer_heap[0];
+	pool->timer_heap_len--;
+	if (pool->timer_heap_len > 0) {
+		pool->timer_heap[0] = pool->timer_heap[pool->timer_heap_len];
+		ior_threads_pool_timer_sift_down(pool, 0);
+	}
+	return top;
+}
+
+/*
+ * Arm a timeout. Validates the timespec and enqueues a pending timer for the
+ * timer thread. Invalid timespecs (and a heap allocation failure) complete
+ * inline so the caller never has to special-case them. The SQ slot is released
+ * either here (inline error) or by the timer thread on expiry.
+ */
+static void ior_threads_pool_arm_timer(
+		ior_threads_pool *pool, const ior_sqe *sqe, uint64_t position)
+{
+	ior_ctx_threads *ctx = pool->ctx;
+	ior_timespec *ts = (ior_timespec *) (uintptr_t) sqe->threads.addr;
+	int err = 0;
+
+	if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L) {
+		err = EINVAL;
+	}
+
+	if (!err) {
+		ior_threads_pool_timer timer = {
+			.deadline_ns = ior_threads_pool_monotonic_ns()
+					+ (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec,
+			.position = position,
+			.user_data = sqe->threads.user_data,
+		};
+
+		pthread_mutex_lock(&pool->timer_lock);
+		int ret = ior_threads_pool_timer_push(pool, timer);
+		if (ret == 0) {
+			pthread_cond_signal(&pool->timer_cond);
+		}
+		pthread_mutex_unlock(&pool->timer_lock);
+
+		if (ret < 0) {
+			err = ENOMEM;
+		}
+	}
+
+	if (err) {
+		ior_cqe cqe;
+		memset(&cqe, 0, sizeof(cqe));
+		cqe.threads.user_data = sqe->threads.user_data;
+		cqe.threads.res = -err;
+		ior_threads_pool_post_completion(pool, &cqe);
+		ior_threads_ring_complete_sqe(&ctx->sq_ring, position);
+	}
+}
+
+static void *ior_threads_pool_timer_thread_func(void *arg)
+{
+	ior_threads_pool *pool = (ior_threads_pool *) arg;
+	ior_ctx_threads *ctx = pool->ctx;
+
+	IOR_LOG_TRACE("timer thread created");
+
+	pthread_mutex_lock(&pool->timer_lock);
+
+	while (!atomic_load(&pool->shutdown)) {
+		// Wait for a timer to be queued.
+		while (pool->timer_heap_len == 0 && !atomic_load(&pool->shutdown)) {
+			pthread_cond_wait(&pool->timer_cond, &pool->timer_lock);
+		}
+		if (atomic_load(&pool->shutdown)) {
+			break;
+		}
+
+		uint64_t now = ior_threads_pool_monotonic_ns();
+		uint64_t deadline = pool->timer_heap[0].deadline_ns;
+
+		if (deadline > now) {
+			/*
+			 * Sleep until the earliest deadline. pthread_cond_timedwait uses
+			 * CLOCK_REALTIME, so convert the monotonic remaining time into an
+			 * absolute realtime deadline. A wall-clock step only causes an
+			 * early wakeup, after which we recompute against the monotonic
+			 * clock and wait again - so the duration stays monotonic-based.
+			 */
+			uint64_t remaining_ns = deadline - now;
+			struct timespec rt;
+			clock_gettime(CLOCK_REALTIME, &rt);
+			uint64_t abs_ns = (uint64_t) rt.tv_sec * 1000000000ULL + (uint64_t) rt.tv_nsec
+					+ remaining_ns;
+			struct timespec until = {
+				.tv_sec = (time_t) (abs_ns / 1000000000ULL),
+				.tv_nsec = (long) (abs_ns % 1000000000ULL),
+			};
+			pthread_cond_timedwait(&pool->timer_cond, &pool->timer_lock, &until);
+			continue;
+		}
+
+		// Earliest timer has expired: pop it and fire outside the lock.
+		ior_threads_pool_timer fired = ior_threads_pool_timer_pop(pool);
+		pthread_mutex_unlock(&pool->timer_lock);
+
+		ior_cqe cqe;
+		memset(&cqe, 0, sizeof(cqe));
+		cqe.threads.user_data = fired.user_data;
+		cqe.threads.res = -ETIME;
+
+		IOR_LOG_TRACE("timer fired: pos=%lu, res=%d", fired.position, cqe.threads.res);
+		ior_threads_pool_post_completion(pool, &cqe);
+		ior_threads_ring_complete_sqe(&ctx->sq_ring, fired.position);
+
+		pthread_mutex_lock(&pool->timer_lock);
+	}
+
+	pthread_mutex_unlock(&pool->timer_lock);
+	IOR_LOG_TRACE("timer thread exiting");
+	return NULL;
 }
 
 // ===== Splice Emulation =====
