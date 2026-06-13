@@ -54,8 +54,9 @@ static void test_wait_cqe_timeout(void **state)
 	ior_cqe *cqe;
 	ret = ior_wait_cqe_timeout(ts->ctx, &cqe, &timeout);
 
-	// Should timeout since operation takes 10s but we only wait 100ms
-	assert_true(ret == -EAGAIN || ret == -ETIME || ret == -ETIMEDOUT);
+	// The 2s operation outlasts the 100ms wait, so the wait must time out with
+	// the canonical -ETIME (same on every backend).
+	assert_int_equal(ret, -ETIME);
 
 	// Clean up - the timeout operation will still complete eventually
 	// We can just exit the context to cancel it
