@@ -236,6 +236,22 @@ static void ior_uring_backend_prep_timeout(
 	io_uring_prep_timeout(s, (struct __kernel_timespec *) ts, count, flags);
 }
 
+static void ior_uring_backend_prep_send(
+		ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	// io_uring uses int fd - cast from ior_fd_t (which is int on Linux)
+	io_uring_prep_send(s, (int) sockfd, buf, nbytes, flags);
+}
+
+static void ior_uring_backend_prep_recv(
+		ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	// io_uring uses int fd - cast from ior_fd_t (which is int on Linux)
+	io_uring_prep_recv(s, (int) sockfd, buf, nbytes, flags);
+}
+
 static void ior_uring_backend_sqe_set_data(ior_sqe *sqe, void *data)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
@@ -303,6 +319,8 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_write = ior_uring_backend_prep_write,
 	.prep_splice = ior_uring_backend_prep_splice,
 	.prep_timeout = ior_uring_backend_prep_timeout,
+	.prep_send = ior_uring_backend_prep_send,
+	.prep_recv = ior_uring_backend_prep_recv,
 	.sqe_set_data = ior_uring_backend_sqe_set_data,
 	.sqe_set_flags = ior_uring_backend_sqe_set_flags,
 	.cqe_get_data = ior_uring_backend_cqe_get_data,

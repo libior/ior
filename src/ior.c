@@ -188,6 +188,22 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
 	}
 }
 
+void ior_prep_send(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_send(sqe, sockfd, buf, nbytes, flags);
+	}
+}
+
+void ior_prep_recv(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_recv(sqe, sockfd, buf, nbytes, flags);
+	}
+}
+
 void ior_sqe_set_data(ior_ctx *ctx, ior_sqe *sqe, void *data)
 {
 	if (ctx && sqe) {

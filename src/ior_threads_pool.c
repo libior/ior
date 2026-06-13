@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 
 #ifndef __linux__
 typedef off_t loff_t;
@@ -483,6 +484,26 @@ static void ior_threads_pool_process_single_sqe(
 #endif
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("splice end: res=%d", cqe->threads.res);
+			break;
+		}
+
+		case IOR_OP_SEND: {
+			IOR_LOG_TRACE("send start: fd=%d, addr=%p, len=%u, flags=%u", sqe->threads.fd,
+					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.rw_flags);
+			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
+			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
+			cqe->threads.res = (ret < 0) ? -errno : ret;
+			IOR_LOG_TRACE("send end: res=%d", cqe->threads.res);
+			break;
+		}
+
+		case IOR_OP_RECV: {
+			IOR_LOG_TRACE("recv start: fd=%d, addr=%p, len=%u, flags=%u", sqe->threads.fd,
+					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.rw_flags);
+			void *buf = (void *) (uintptr_t) sqe->threads.addr;
+			ssize_t ret = recv(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
+			cqe->threads.res = (ret < 0) ? -errno : ret;
+			IOR_LOG_TRACE("recv end: res=%d", cqe->threads.res);
 			break;
 		}
 

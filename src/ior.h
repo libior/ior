@@ -57,6 +57,8 @@ typedef struct ior_timespec {
 #define IOR_OP_CONNECT 6
 #define IOR_OP_LISTEN 7
 #define IOR_OP_BIND 8
+#define IOR_OP_SEND 9
+#define IOR_OP_RECV 10
 
 /* Setup flags */
 #define IOR_SETUP_SQPOLL (1U << 0)
@@ -138,6 +140,10 @@ void ior_prep_write(
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in, ior_fd_t fd_out,
 		uint64_t off_out, unsigned nbytes, unsigned flags);
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
+void ior_prep_send(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
+void ior_prep_recv(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
 
 void ior_sqe_set_data(ior_ctx *ctx, ior_sqe *sqe, void *data);
 void ior_sqe_set_flags(ior_ctx *ctx, ior_sqe *sqe, uint8_t flags);

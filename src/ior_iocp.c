@@ -3,6 +3,18 @@
 
 #ifdef IOR_HAVE_IOCP
 
+/*
+ * winsock2.h must be included before windows.h (which ior_backend.h pulls in
+ * via ior.h) so that the modern Winsock 2 declarations (WSASend/WSARecv/WSABUF/
+ * SOCKET) win over the legacy winsock.h ones. WIN32_LEAN_AND_MEAN keeps
+ * windows.h from implicitly including winsock.h; winsock2.h itself includes
+ * windows.h in the correct order.
+ */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+
 #include "ior_backend.h"
 #include <stdlib.h>
 #include <stddef.h>
@@ -55,6 +67,13 @@ typedef struct ior_iocp_op {
 	void *buf;
 	uint32_t len;
 	uint64_t offset;
+
+	// Socket I/O (WSASend/WSARecv) bookkeeping. The WSABUF and flags must stay
+	// valid for the whole lifetime of the overlapped operation, so they live in
+	// the op rather than on the issuing thread's stack. For WSARecv sock_flags
+	// is an in/out parameter.
+	WSABUF wsabuf;
+	DWORD sock_flags;
 
 	// Timeout-specific fields
 	ior_timespec *timeout_ts;
@@ -197,6 +216,30 @@ static int win_error_to_errno(DWORD err)
 			return -ENOTSUP;
 		case ERROR_ABANDONED_WAIT_0:
 			return -ECANCELED;
+		/*
+		 * Winsock error codes (10000+) do not overlap with the ERROR_* range
+		 * above, so they coexist in this switch. These surface from WSASend/
+		 * WSARecv either synchronously (WSAGetLastError) or via the completion
+		 * packet's error status.
+		 */
+		case WSAECONNRESET:
+			return -ECONNRESET;
+		case WSAECONNREFUSED:
+			return -ECONNREFUSED;
+		case WSAECONNABORTED:
+			return -ECONNABORTED;
+		case WSAENOTCONN:
+			return -ENOTCONN;
+		case WSAENOTSOCK:
+			return -ENOTSOCK;
+		case WSAESHUTDOWN:
+			return -EPIPE;
+		case WSAEWOULDBLOCK:
+			return -EAGAIN;
+		case WSAEMSGSIZE:
+			return -EMSGSIZE;
+		case WSAETIMEDOUT:
+			return -ETIME;
 		default:
 			return -EIO;
 	}
@@ -381,6 +424,10 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->buf = NULL;
 	op->len = 0;
 	op->offset = 0;
+
+	op->wsabuf.buf = NULL;
+	op->wsabuf.len = 0;
+	op->sock_flags = 0;
 
 	op->timeout_ts = NULL;
 	op->timeout_flags = 0;
@@ -621,6 +668,73 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	// Immediate error with no completion packet - post synthetic
 	return post_synthetic_completion(ctx, op, err, 0);
+}
+
+/*
+ * issue_send / issue_recv
+ *
+ * Socket counterparts of issue_read/issue_write. WSASend/WSARecv behave like
+ * ReadFile/WriteFile with respect to IOCP: a completion packet is posted for
+ * both synchronous success (return 0) and asynchronous start (WSA_IO_PENDING).
+ * Any other Winsock error means no packet is posted, so we synthesize one.
+ *
+ * The op's fd is an ior_fd_t (HANDLE); sockets created with WSA_FLAG_OVERLAPPED
+ * are valid IOCP targets, so we cast the handle to SOCKET for the Winsock call.
+ */
+static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	int ret = ensure_handle_associated(ctx, op->fd);
+	if (ret < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+	}
+
+	op->wsabuf.buf = (CHAR *) op->buf;
+	op->wsabuf.len = op->len;
+
+	int rc = WSASend(
+			(SOCKET) op->fd, &op->wsabuf, 1, NULL, op->sock_flags, &op->overlapped, NULL);
+	if (rc == 0) {
+		// Synchronous success: completion packet will still be posted to IOCP
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	int err = WSAGetLastError();
+	if (err == WSA_IO_PENDING) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	return post_synthetic_completion(ctx, op, (DWORD) err, 0);
+}
+
+static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	int ret = ensure_handle_associated(ctx, op->fd);
+	if (ret < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+	}
+
+	op->wsabuf.buf = (CHAR *) op->buf;
+	op->wsabuf.len = op->len;
+
+	// sock_flags is an in/out parameter for WSARecv and must remain valid for
+	// the whole async operation, hence it lives in the op.
+	int rc = WSARecv(
+			(SOCKET) op->fd, &op->wsabuf, 1, NULL, &op->sock_flags, &op->overlapped, NULL);
+	if (rc == 0) {
+		// Synchronous success: completion packet will still be posted to IOCP
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	int err = WSAGetLastError();
+	if (err == WSA_IO_PENDING) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	return post_synthetic_completion(ctx, op, (DWORD) err, 0);
 }
 
 static void op_to_cqe(ior_iocp_op *op)
@@ -1001,6 +1115,12 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 		case IOR_OP_SPLICE:
 			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+
+		case IOR_OP_SEND:
+			return issue_send(ctx, op);
+
+		case IOR_OP_RECV:
+			return issue_recv(ctx, op);
 
 		case IOR_OP_TIMER:
 			return arm_timer(ctx, op);
@@ -1725,6 +1845,30 @@ static void ior_iocp_backend_prep_timeout(
 	(void) count;
 }
 
+static void ior_iocp_backend_prep_send(
+		ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_SEND;
+	op->fd = sockfd;
+	op->buf = (void *) buf;
+	op->len = nbytes;
+	op->sock_flags = (DWORD) flags;
+}
+
+static void ior_iocp_backend_prep_recv(
+		ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_RECV;
+	op->fd = sockfd;
+	op->buf = buf;
+	op->len = nbytes;
+	op->sock_flags = (DWORD) flags;
+}
+
 static void ior_iocp_backend_sqe_set_data(ior_sqe *sqe, void *data)
 {
 	ior_iocp_op *op = (ior_iocp_op *) sqe;
@@ -1788,6 +1932,8 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_write = ior_iocp_backend_prep_write,
 	.prep_splice = ior_iocp_backend_prep_splice,
 	.prep_timeout = ior_iocp_backend_prep_timeout,
+	.prep_send = ior_iocp_backend_prep_send,
+	.prep_recv = ior_iocp_backend_prep_recv,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,
 	.cqe_get_data = ior_iocp_backend_cqe_get_data,

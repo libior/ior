@@ -236,6 +236,14 @@ void ior_prep_read(ior_ctx *ctx, ior_sqe *sqe, int fd, void *buf,
 void ior_prep_write(ior_ctx *ctx, ior_sqe *sqe, int fd, const void *buf,
                     unsigned nbytes, uint64_t offset);
 
+// Send operation (socket)
+void ior_prep_send(ior_ctx *ctx, ior_sqe *sqe, int sockfd, const void *buf,
+                   unsigned nbytes, int flags);
+
+// Receive operation (socket)
+void ior_prep_recv(ior_ctx *ctx, ior_sqe *sqe, int sockfd, void *buf,
+                   unsigned nbytes, int flags);
+
 // Timeout operation
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
                       unsigned count, unsigned flags);

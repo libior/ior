@@ -385,6 +385,28 @@ static void ior_threads_backend_prep_timeout(
 	sqe->threads.timeout_flags = flags;
 }
 
+static void ior_threads_backend_prep_send(
+		ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_SEND;
+	sqe->threads.fd = sockfd;
+	sqe->threads.addr = (uint64_t) (uintptr_t) buf;
+	sqe->threads.len = nbytes;
+	sqe->threads.rw_flags = (uint32_t) flags;
+}
+
+static void ior_threads_backend_prep_recv(
+		ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_RECV;
+	sqe->threads.fd = sockfd;
+	sqe->threads.addr = (uint64_t) (uintptr_t) buf;
+	sqe->threads.len = nbytes;
+	sqe->threads.rw_flags = (uint32_t) flags;
+}
+
 static void ior_threads_backend_sqe_set_data(ior_sqe *sqe, void *data)
 {
 	sqe->threads.user_data = (uint64_t) (uintptr_t) data;
@@ -447,6 +469,8 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_write = ior_threads_backend_prep_write,
 	.prep_splice = ior_threads_backend_prep_splice,
 	.prep_timeout = ior_threads_backend_prep_timeout,
+	.prep_send = ior_threads_backend_prep_send,
+	.prep_recv = ior_threads_backend_prep_recv,
 	.sqe_set_data = ior_threads_backend_sqe_set_data,
 	.sqe_set_flags = ior_threads_backend_sqe_set_flags,
 	.cqe_get_data = ior_threads_backend_cqe_get_data,

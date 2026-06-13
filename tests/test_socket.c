@@ -1,20 +1,17 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * test_socket.c - Read/write coverage over connected stream sockets.
+ * test_socket.c - Read/write and send/recv coverage over connected stream
+ * sockets.
  *
  * These tests use a connected stream socket pair (test_make_socketpair):
  * AF_UNIX socketpair on POSIX, a loopback AF_INET TCP pair on Windows. They
- * exercise ONLY plain ior_prep_read / ior_prep_write on socket fds - the
- * dedicated socket operations (accept/connect/send/recv) are not part of the
- * public API yet, so there is nothing to test for those here.
+ * exercise plain ior_prep_read / ior_prep_write on socket fds as well as the
+ * dedicated ior_prep_send / ior_prep_recv socket operations.
  *
- * NOTE ON IOCP: socket support in the IOCP backend is incomplete - read/write
- * are routed through ReadFile/WriteFile rather than WSARecv/WSASend. On
- * io_uring the kernel treats socket fds uniformly, so these pass. On IOCP a
- * failure or 30s-timeout hang here is LEGITIMATE signal that the socket I/O
- * routing still needs the WSARecv/WSASend work, not a flaky test. The whole
- * suite uses offset 0 because sockets are not seekable and the backend must
- * not treat the offset as a file position for a socket fd.
+ * NOTE ON IOCP: read/write are routed through ReadFile/WriteFile while
+ * send/recv use WSASend/WSARecv. On io_uring the kernel treats socket fds
+ * uniformly. The whole suite uses offset 0 because sockets are not seekable and
+ * the backend must not treat the offset as a file position for a socket fd.
  */
 #include "test_utils.h"
 
@@ -206,6 +203,127 @@ static void test_socket_read_after_peer_close(void **state)
 	assert_int_equal(res, 0);
 }
 
+/* ===================================================================== */
+/* send/recv round-trip                                                  */
+/* ===================================================================== */
+
+/* Send a payload into sock[0] with ior_prep_send, receive it from sock[1]
+ * with ior_prep_recv, and verify the bytes match. */
+static void test_socket_send_then_recv(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	const char *msg = "send/recv roundtrip";
+	unsigned len = (unsigned) strlen(msg);
+
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[0], msg, len, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, snd, (void *) 0x30), (int32_t) len);
+
+	char buf[64];
+	memset(buf, 0, sizeof(buf));
+
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, len, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, rcv, (void *) 0x31), (int32_t) len);
+
+	assert_memory_equal(buf, msg, len);
+}
+
+/* Cross-check that send/recv interoperate with write/read: data written with
+ * ior_prep_write is readable via ior_prep_recv and vice versa, since they are
+ * just different ways to move bytes over the same stream socket. */
+static void test_socket_send_recv_interop_with_rw(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	/* write -> recv */
+	const char *msg1 = "written, received";
+	unsigned len1 = (unsigned) strlen(msg1);
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	ior_prep_write(s->ctx, w, s->sock[0], msg1, len1, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, w, (void *) 0x40), (int32_t) len1);
+
+	char buf[64];
+	memset(buf, 0, sizeof(buf));
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, len1, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, rcv, (void *) 0x41), (int32_t) len1);
+	assert_memory_equal(buf, msg1, len1);
+
+	/* send -> read */
+	const char *msg2 = "sent, then read";
+	unsigned len2 = (unsigned) strlen(msg2);
+
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[1], msg2, len2, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, snd, (void *) 0x42), (int32_t) len2);
+
+	memset(buf, 0, sizeof(buf));
+	ior_sqe *r = ior_get_sqe(s->ctx);
+	assert_non_null(r);
+	ior_prep_read(s->ctx, r, s->sock[0], buf, len2, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, r, (void *) 0x43), (int32_t) len2);
+	assert_memory_equal(buf, msg2, len2);
+}
+
+/* recv with a buffer smaller than the sent payload returns a short read; a
+ * second recv drains the remainder. Mirrors test_socket_partial_read. */
+static void test_socket_partial_recv(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	const char *msg = "0123456789ABCDEF"; /* 16 bytes */
+	unsigned len = (unsigned) strlen(msg);
+
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[0], msg, len, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, snd, (void *) 0x50), (int32_t) len);
+
+	char buf[32];
+	memset(buf, 0, sizeof(buf));
+
+	ior_sqe *r1 = ior_get_sqe(s->ctx);
+	assert_non_null(r1);
+	ior_prep_recv(s->ctx, r1, s->sock[1], buf, 6, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, r1, (void *) 0x51), 6);
+	assert_memory_equal(buf, "012345", 6);
+
+	memset(buf, 0, sizeof(buf));
+	ior_sqe *r2 = ior_get_sqe(s->ctx);
+	assert_non_null(r2);
+	ior_prep_recv(s->ctx, r2, s->sock[1], buf, len - 6, 0);
+	assert_int_equal(submit_one_and_get_res(s->ctx, r2, (void *) 0x52), (int32_t) (len - 6));
+	assert_memory_equal(buf, "6789ABCDEF", len - 6);
+}
+
+/* recv after the peer closes its end completes with res == 0 (EOF), mirroring
+ * test_socket_read_after_peer_close but on the send/recv path. */
+static void test_socket_recv_after_peer_close(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	test_close_fd(s->sock[0]);
+	s->sock[0] = IOR_TEST_INVALID_FD;
+
+	char buf[32];
+	memset(buf, 0, sizeof(buf));
+
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, sizeof(buf), 0);
+	int32_t res = submit_one_and_get_res(s->ctx, rcv, (void *) 0x60);
+
+	assert_int_equal(res, 0);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -217,6 +335,14 @@ int main(void)
 				test_socket_partial_read, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
 				test_socket_read_after_peer_close, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_send_then_recv, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_send_recv_interop_with_rw, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_partial_recv, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_recv_after_peer_close, setup_socketpair, teardown_socketpair),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);
