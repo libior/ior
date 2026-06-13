@@ -14,25 +14,17 @@ The goal is to provide maximum performance on platforms with native async I/O su
 
 ## Features
 
-### Current (Stage 1)
-- Read operations
-- Write operations  
+- Read and write operations
+- Socket send and receive operations
 - Timer/timeout operations
-- Splice operations (Linux)
+- Splice operations (native on Linux, emulated elsewhere)
 - Operation chaining with `IOR_SQE_IO_LINK`
 - Ordering with `IOR_SQE_IO_DRAIN`
-- Thread pool emulation backend
-- Linux io_uring backend (with liburing)
-- Windows IOCP backend
-- eventfd-based notification (Linux/FreeBSD 13+)
-- Pipe-based notification fallback
-
-### Planned (Stage 2)
-- Accept operations
-- Connect operations
-- Bind operations
-- Listen operations
-- Additional io_uring operations
+- Three backends with a uniform API:
+  - Linux io_uring (via liburing)
+  - Windows IOCP
+  - Portable thread-pool fallback (all other platforms)
+- eventfd-based completion notification (Linux/FreeBSD 13+), with a pipe-based fallback
 
 ## Building
 
@@ -331,10 +323,9 @@ Completion Port:
   of the port, matching io_uring ordering semantics
 - Operations are drawn from a pre-allocated pool to avoid per-op allocation
 
-> **Note:** The IOCP backend currently supports file I/O. Socket operations
-> (accept/connect/send/recv) are part of Stage 2 and not yet wired up; plain
-> read/write on a socket handle goes through the file path and is not yet
-> recommended for sockets on Windows.
+> **Note:** On the IOCP backend, file I/O uses `ReadFile`/`WriteFile` and socket
+> send/receive use `WSASend`/`WSARecv`. For sockets on Windows, prefer
+> `ior_prep_send`/`ior_prep_recv` over plain read/write.
 
 ## Performance Considerations
 
