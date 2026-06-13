@@ -61,6 +61,12 @@ int ior_threads_ring_init(ior_threads_ring *ring, uint32_t size, uint8_t is_sq)
 			free(ring->entries);
 			return -ENOMEM;
 		}
+	} else {
+		// CQ ring: producers are serialized through tail_lock (MPSC).
+		if (pthread_mutex_init(&ring->tail_lock, NULL) != 0) {
+			free(ring->entries);
+			return -ENOMEM;
+		}
 	}
 
 	return 0;
@@ -76,6 +82,8 @@ void ior_threads_ring_destroy(ior_threads_ring *ring)
 		pthread_cond_destroy(&ring->head_cond);
 		pthread_mutex_destroy(&ring->head_lock);
 		free(ring->completed);
+	} else {
+		pthread_mutex_destroy(&ring->tail_lock);
 	}
 
 	free(ring->entries);
@@ -242,10 +250,20 @@ int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe)
 		return -EINVAL;
 	}
 
+	/*
+	 * Multiple producers (worker threads and the timer thread) may post
+	 * concurrently, so the read-modify-write of tail must be serialized;
+	 * otherwise two producers could claim the same slot and lose a completion.
+	 * The single consumer never takes this lock - it only reads tail (acquire)
+	 * and owns head - so this stays a lightweight MPSC handoff.
+	 */
+	pthread_mutex_lock(&ring->tail_lock);
+
 	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
 	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
 
 	if (tail - head >= ring->size) {
+		pthread_mutex_unlock(&ring->tail_lock);
 		return -EOVERFLOW;
 	}
 
@@ -253,6 +271,8 @@ int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe)
 	((ior_cqe *) ring->entries)[index] = *cqe;
 
 	atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
+
+	pthread_mutex_unlock(&ring->tail_lock);
 	return 0;
 }
 

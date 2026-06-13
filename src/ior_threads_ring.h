@@ -43,6 +43,10 @@ typedef struct ior_threads_ring {
 	uint8_t *completed; // Bitmap: 1 if position completed
 	pthread_mutex_t head_lock; // Protects head advancement
 	pthread_cond_t head_cond; // Signals when head moves
+
+	// CQ only: serializes the multiple completion producers (worker threads and
+	// the timer thread) against the single consumer. Completions are MPSC.
+	pthread_mutex_t tail_lock;
 } ior_threads_ring;
 
 // Initialize ring with given size (must be power of 2)
