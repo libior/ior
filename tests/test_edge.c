@@ -401,6 +401,89 @@ static void test_link_two_nops_order(void **state)
 }
 
 /* ===================================================================== */
+/* CQE consumer contract (peek / wait / seen) - same across backends     */
+/* ===================================================================== */
+
+/*
+ * peek_cqe must not consume the completion and must be idempotent: two peeks
+ * return the same CQE, and a subsequent wait returns that very same CQE. After
+ * cqe_seen consumes it, peek reports the queue empty (-EAGAIN).
+ */
+static void test_peek_nonconsuming_and_stable(void **state)
+{
+	test_state *ts = (test_state *) *state;
+
+	ior_sqe *sqe = ior_get_sqe(ts->ctx);
+	assert_non_null(sqe);
+	ior_prep_nop(ts->ctx, sqe);
+	ior_sqe_set_data(ts->ctx, sqe, (void *) (uintptr_t) 0xAB);
+
+	int ret = ior_submit_and_wait(ts->ctx, 1);
+	assert_true(ret >= 0);
+
+	ior_cqe *c1 = NULL, *c2 = NULL, *c3 = NULL;
+
+	assert_return_code(ior_peek_cqe(ts->ctx, &c1), 0);
+	assert_non_null(c1);
+
+	/* Second peek returns the same CQE - nothing was consumed. */
+	assert_return_code(ior_peek_cqe(ts->ctx, &c2), 0);
+	assert_ptr_equal(c1, c2);
+
+	/* wait must hand back the same CQE peek already exposed. */
+	assert_return_code(ior_wait_cqe(ts->ctx, &c3), 0);
+	assert_ptr_equal(c1, c3);
+
+	assert_int_equal((uintptr_t) ior_cqe_get_data(ts->ctx, c1), (uintptr_t) 0xAB);
+
+	/* Now consume exactly one; the queue must report empty afterwards. */
+	ior_cqe_seen(ts->ctx, c1);
+
+	ior_cqe *c4 = NULL;
+	assert_int_equal(ior_peek_cqe(ts->ctx, &c4), -EAGAIN);
+}
+
+/*
+ * wait_cqe_timeout on an idle queue must return the canonical -ETIME once the
+ * timeout elapses (not -EAGAIN / -ETIMEDOUT), identically on every backend.
+ */
+static void test_wait_timeout_etime(void **state)
+{
+	test_state *ts = (test_state *) *state;
+
+	ior_timespec t = { .tv_sec = 0, .tv_nsec = 50000000 /* 50ms */ };
+	ior_cqe *cqe = NULL;
+	int ret = ior_wait_cqe_timeout(ts->ctx, &cqe, &t);
+	assert_int_equal(ret, -ETIME);
+}
+
+/*
+ * wait_cqe_timeout must return the completion immediately (res 0) when one is
+ * already available, rather than waiting out or mis-reporting the timeout.
+ */
+static void test_wait_timeout_ready(void **state)
+{
+	test_state *ts = (test_state *) *state;
+
+	ior_sqe *sqe = ior_get_sqe(ts->ctx);
+	assert_non_null(sqe);
+	ior_prep_nop(ts->ctx, sqe);
+	ior_sqe_set_data(ts->ctx, sqe, (void *) (uintptr_t) 0xCD);
+
+	int ret = ior_submit_and_wait(ts->ctx, 1);
+	assert_true(ret >= 0);
+
+	ior_timespec t = { .tv_sec = 5, .tv_nsec = 0 };
+	ior_cqe *cqe = NULL;
+	ret = ior_wait_cqe_timeout(ts->ctx, &cqe, &t);
+	assert_return_code(ret, 0);
+	assert_non_null(cqe);
+	assert_int_equal((uintptr_t) ior_cqe_get_data(ts->ctx, cqe), (uintptr_t) 0xCD);
+
+	ior_cqe_seen(ts->ctx, cqe);
+}
+
+/* ===================================================================== */
 /* Main                                                                  */
 /* ===================================================================== */
 
@@ -427,6 +510,10 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_read_past_eof, setup_temp_file, teardown_temp_file),
 		cmocka_unit_test_setup_teardown(
 				test_link_two_nops_order, setup_temp_file, teardown_temp_file),
+		cmocka_unit_test_setup_teardown(
+				test_peek_nonconsuming_and_stable, setup_ior_ctx, teardown_ior_ctx),
+		cmocka_unit_test_setup_teardown(test_wait_timeout_etime, setup_ior_ctx, teardown_ior_ctx),
+		cmocka_unit_test_setup_teardown(test_wait_timeout_ready, setup_ior_ctx, teardown_ior_ctx),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

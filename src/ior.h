@@ -123,12 +123,89 @@ ior_sqe *ior_get_sqe(ior_ctx *ctx);
 int ior_submit(ior_ctx *ctx);
 int ior_submit_and_wait(ior_ctx *ctx, unsigned wait_nr);
 
-/* Completion */
+/* Completion
+ *
+ * All backends honor the same completion-queue contract, modeled on io_uring.
+ * A completion (CQE) returned by peek or wait is NOT consumed by those calls:
+ * it stays valid and stable - repeated peeks/waits return the same CQE - until
+ * it is consumed with ior_cqe_seen or ior_cq_advance.
+ */
+
+/**
+ * Non-blocking check for a ready completion.
+ *
+ * Does not consume the completion; a subsequent peek or wait returns the same
+ * CQE until it is consumed with ior_cqe_seen() or ior_cq_advance().
+ *
+ * @param ctx      I/O context.
+ * @param cqe_out  On success, set to the completion at the head of the queue.
+ * @return 0 if a completion was available, -EAGAIN if none is ready, or
+ *         -EINVAL if ctx or cqe_out is NULL.
+ */
 int ior_peek_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
+
+/**
+ * Block until a completion is ready.
+ *
+ * Waits indefinitely for the next completion. Does not return -EAGAIN
+ * spuriously and does not consume the completion (the returned CQE is identical
+ * to what ior_peek_cqe() would return).
+ *
+ * @param ctx      I/O context.
+ * @param cqe_out  On success, set to the completion at the head of the queue.
+ * @return 0 on success, or a negative errno on failure (e.g. -EINVAL if ctx or
+ *         cqe_out is NULL, -EINTR if interrupted).
+ */
 int ior_wait_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
+
+/**
+ * Block until a completion is ready or the timeout elapses.
+ *
+ * Like ior_wait_cqe() but bounded by @p timeout. Does not consume the
+ * completion.
+ *
+ * @param ctx      I/O context.
+ * @param cqe_out  On success, set to the completion at the head of the queue.
+ * @param timeout  Maximum time to wait, or NULL to wait indefinitely.
+ * @return 0 on success, -ETIME if the timeout elapsed before a completion
+ *         arrived, or a negative errno on failure (e.g. -EINVAL for NULL ctx /
+ *         cqe_out or an invalid timeout).
+ */
 int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, ior_timespec *timeout);
+
+/**
+ * Consume a single completion.
+ *
+ * Marks the completion at the head of the queue as seen, advancing the queue by
+ * one. Equivalent to ior_cq_advance(ctx, 1). After this call the CQE pointer
+ * must not be used.
+ *
+ * @param ctx  I/O context.
+ * @param cqe  The completion previously obtained from peek/wait.
+ */
 void ior_cqe_seen(ior_ctx *ctx, ior_cqe *cqe);
+
+/**
+ * Peek at a batch of ready completions without consuming them.
+ *
+ * Fills @p cqes with up to @p max completions currently ready. The completions
+ * are not consumed; release them afterwards with ior_cq_advance().
+ *
+ * @param ctx   I/O context.
+ * @param cqes  Array receiving pointers to ready completions.
+ * @param max   Capacity of @p cqes.
+ * @return The number of completions written to @p cqes (0 if none are ready).
+ */
 unsigned ior_peek_batch_cqe(ior_ctx *ctx, ior_cqe **cqes, unsigned max);
+
+/**
+ * Consume @p nr completions from the head of the queue.
+ *
+ * Typically used to release a batch obtained via ior_peek_batch_cqe().
+ *
+ * @param ctx  I/O context.
+ * @param nr   Number of completions to consume; 0 is a no-op.
+ */
 void ior_cq_advance(ior_ctx *ctx, unsigned nr);
 
 /* Helper functions - work on opaque types via callbacks */

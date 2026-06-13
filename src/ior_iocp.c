@@ -1622,20 +1622,27 @@ static int ior_iocp_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	if (!ready_queue_empty(&ctx->ready)) {
-		ior_iocp_op *op = ready_queue_peek(&ctx->ready);
-		*cqe_out = &op->cqe;
-		return 0;
-	}
+	/*
+	 * Block until a completion is ready. A stray NULL completion packet (e.g.
+	 * an external PostQueuedCompletionStatus with a NULL OVERLAPPED) surfaces as
+	 * -EAGAIN from dequeue_one_completion under an INFINITE wait; that is not a
+	 * real completion, so we keep waiting rather than returning it.
+	 */
+	for (;;) {
+		if (!ready_queue_empty(&ctx->ready)) {
+			ior_iocp_op *op = ready_queue_peek(&ctx->ready);
+			*cqe_out = &op->cqe;
+			return 0;
+		}
 
-	int ret = dequeue_one_completion(ctx, INFINITE);
-	if (ret < 0) {
-		return ret;
+		int ret = dequeue_one_completion(ctx, INFINITE);
+		if (ret == -EAGAIN) {
+			continue;
+		}
+		if (ret < 0) {
+			return ret;
+		}
 	}
-
-	ior_iocp_op *op = ready_queue_peek(&ctx->ready);
-	*cqe_out = &op->cqe;
-	return 0;
 }
 
 static int ior_iocp_backend_wait_cqe_timeout(
@@ -1647,31 +1654,56 @@ static int ior_iocp_backend_wait_cqe_timeout(
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	if (!ready_queue_empty(&ctx->ready)) {
-		ior_iocp_op *op = ready_queue_peek(&ctx->ready);
-		*cqe_out = &op->cqe;
-		return 0;
-	}
-
-	DWORD timeout_ms = INFINITE;
+	// Validate the timeout and turn it into an absolute deadline so spurious
+	// (stray-packet) wakeups can resume the wait without extending it.
+	int has_deadline = 0;
+	uint64_t deadline_ns = 0;
 	if (timeout) {
 		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
 			return -EINVAL;
 		}
-		timeout_ms = (DWORD) (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000);
-		if (timeout_ms == 0 && (timeout->tv_sec > 0 || timeout->tv_nsec > 0)) {
-			timeout_ms = 1;
+		deadline_ns = qpc_now_ns()
+				+ (uint64_t) timeout->tv_sec * 1000000000ULL + (uint64_t) timeout->tv_nsec;
+		has_deadline = 1;
+	}
+
+	for (;;) {
+		if (!ready_queue_empty(&ctx->ready)) {
+			ior_iocp_op *op = ready_queue_peek(&ctx->ready);
+			*cqe_out = &op->cqe;
+			return 0;
 		}
-	}
 
-	int ret = dequeue_one_completion(ctx, timeout_ms);
-	if (ret < 0) {
-		return ret;
-	}
+		// Compute how long to block. If the deadline has already passed we still
+		// do one non-blocking poll (timeout_ms = 0) so a completion sitting in
+		// the IOCP is not missed, then report -ETIME below.
+		DWORD timeout_ms = INFINITE;
+		if (has_deadline) {
+			uint64_t now_ns = qpc_now_ns();
+			if (now_ns >= deadline_ns) {
+				timeout_ms = 0;
+			} else {
+				// Round remaining time up to whole milliseconds, clamped below
+				// INFINITE (which doubles as the "no timeout" sentinel).
+				uint64_t rem_ms = (deadline_ns - now_ns + 999999ULL) / 1000000ULL;
+				timeout_ms = rem_ms >= INFINITE ? (INFINITE - 1) : (DWORD) rem_ms;
+			}
+		}
 
-	ior_iocp_op *op = ready_queue_peek(&ctx->ready);
-	*cqe_out = &op->cqe;
-	return 0;
+		int ret = dequeue_one_completion(ctx, timeout_ms);
+		if (ret == 0) {
+			continue; // got a completion; loop returns it from the ready queue
+		}
+		if (ret == -EAGAIN || ret == -ETIMEDOUT) {
+			// Nothing ready (stray NULL packet, or the wait elapsed). Give up
+			// only once the deadline has passed; otherwise resume waiting.
+			if (has_deadline && qpc_now_ns() >= deadline_ns) {
+				return -ETIME;
+			}
+			continue;
+		}
+		return ret; // genuine error
+	}
 }
 
 static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)

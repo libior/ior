@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <poll.h>
+#include <limits.h>
 
 /* Ensure size is power of 2 */
 static uint32_t ior_threads_round_up_pow2(uint32_t n)
@@ -221,30 +222,29 @@ static int ior_threads_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_threads *ctx = backend_ctx;
 
-	// Fast path: check if CQE already available
-	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
-	if (cqe) {
-		*cqe_out = cqe;
-		return 0;
+	/*
+	 * Block until a CQE is actually available. The event is only a wakeup hint
+	 * (it may be stale, or the CQE may have been consumed already), so a wakeup
+	 * with nothing in the ring is not an error - we re-check and wait again
+	 * rather than returning -EAGAIN. event_wait(-1) sleeps in poll() until a
+	 * producer signals, so this loop blocks rather than spins. The ring, not
+	 * the event, is the source of truth, so the leading peek also covers any
+	 * signal drained on a previous iteration.
+	 */
+	for (;;) {
+		ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+		if (cqe) {
+			*cqe_out = cqe;
+			return 0;
+		}
+
+		int ret = ior_threads_event_wait(&ctx->event, -1);
+		if (ret < 0) {
+			return ret; // genuine error (e.g. -EINTR)
+		}
+
+		ior_threads_event_clear(&ctx->event);
 	}
-
-	// Wait for notification
-	int ret = ior_threads_event_wait(&ctx->event, -1);
-	if (ret < 0) {
-		return ret;
-	}
-
-	// Clear all pending notifications
-	ior_threads_event_clear(&ctx->event);
-
-	// Get CQE
-	cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
-	if (!cqe) {
-		return -EAGAIN; // Spurious wakeup
-	}
-
-	*cqe_out = cqe;
-	return 0;
 }
 
 static int ior_threads_backend_wait_cqe_timeout(
@@ -256,47 +256,57 @@ static int ior_threads_backend_wait_cqe_timeout(
 
 	ior_ctx_threads *ctx = backend_ctx;
 
-	// Fast path: check if CQE already available
-	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
-	if (cqe) {
-		*cqe_out = cqe;
-		return 0;
-	}
-
-	// Convert timespec to milliseconds for event_wait
-	int timeout_ms = -1; // Infinite by default
-
+	// Validate the timeout and turn it into an absolute monotonic deadline so
+	// that spurious wakeups can resume the wait without extending it.
+	int has_deadline = 0;
+	uint64_t deadline_ns = 0;
 	if (timeout) {
 		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
 			return -EINVAL;
 		}
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		deadline_ns = (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec
+				+ (uint64_t) timeout->tv_sec * 1000000000ULL + (uint64_t) timeout->tv_nsec;
+		has_deadline = 1;
+	}
 
-		// Convert to milliseconds
-		timeout_ms = (int) (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000);
-
-		// Handle zero timeout specially
-		if (timeout_ms == 0 && (timeout->tv_sec > 0 || timeout->tv_nsec > 0)) {
-			timeout_ms = 1; // At least 1ms
+	/*
+	 * Same loop as ior_wait_cqe, but bounded by the deadline. A stale/spurious
+	 * wakeup resumes the wait against the remaining time rather than returning;
+	 * once the deadline passes we report -ETIME (matching io_uring), not -EAGAIN.
+	 */
+	for (;;) {
+		ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+		if (cqe) {
+			*cqe_out = cqe;
+			return 0;
 		}
+
+		int timeout_ms = -1;
+		if (has_deadline) {
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			uint64_t now_ns = (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec;
+			if (now_ns >= deadline_ns) {
+				return -ETIME;
+			}
+			// Round remaining time up to whole milliseconds (poll's resolution),
+			// clamped to int range.
+			uint64_t rem_ms = (deadline_ns - now_ns + 999999ULL) / 1000000ULL;
+			timeout_ms = rem_ms > (uint64_t) INT_MAX ? INT_MAX : (int) rem_ms;
+		}
+
+		int ret = ior_threads_event_wait(&ctx->event, timeout_ms);
+		if (ret == -ETIMEDOUT) {
+			continue; // loop re-checks the ring, then the deadline -> -ETIME
+		}
+		if (ret < 0) {
+			return ret; // genuine error (e.g. -EINTR)
+		}
+
+		ior_threads_event_clear(&ctx->event);
 	}
-
-	// Wait with timeout
-	int ret = ior_threads_event_wait(&ctx->event, timeout_ms);
-	if (ret < 0) {
-		return ret; // -ETIMEDOUT or other error
-	}
-
-	// Clear notifications
-	ior_threads_event_clear(&ctx->event);
-
-	// Get CQE
-	cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
-	if (!cqe) {
-		return -EAGAIN; // Spurious wakeup or timeout
-	}
-
-	*cqe_out = cqe;
-	return 0;
 }
 
 static void ior_threads_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
