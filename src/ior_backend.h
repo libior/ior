@@ -131,6 +131,7 @@ typedef struct ior_backend_ops {
 	void (*prep_splice)(ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in, ior_fd_t fd_out,
 			uint64_t off_out, unsigned nbytes, unsigned flags);
 	void (*prep_timeout)(ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
+	void (*prep_link_timeout)(ior_sqe *sqe, ior_timespec *ts, unsigned flags);
 	void (*prep_send)(ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
 	void (*prep_recv)(ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
 	void (*sqe_set_data)(ior_sqe *sqe, void *data);

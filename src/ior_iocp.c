@@ -84,6 +84,13 @@ typedef struct ior_iocp_op {
 	bool timer_armed; // True once enqueued into timer heap
 	bool timer_cancelled; // True if timer was cancelled (future use)
 
+	// Linked timeout (IOR_OP_LINK_TIMEOUT) pairing. On the guarded op,
+	// link_timeout points to its watchdog timeout op; on the timeout op, guarded
+	// points back to the op it guards. Exactly one of the completion path and the
+	// timer thread resolves the pair, arbitrated by timer_armed under timers.lock.
+	struct ior_iocp_op *link_timeout;
+	struct ior_iocp_op *guarded;
+
 	// Scheduling / ordering
 	uint64_t seq; // submission sequence (1..)
 	uint64_t drain_after; // for DRAIN: must wait until completed_count >= drain_after
@@ -436,6 +443,9 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->timer_armed = false;
 	op->timer_cancelled = false;
 
+	op->link_timeout = NULL;
+	op->guarded = NULL;
+
 	op->seq = 0;
 	op->drain_after = 0;
 	op->link_next = NULL;
@@ -562,6 +572,26 @@ static int post_synthetic_completion(
 
 	atomic_fetch_add(&ctx->active_count, 1);
 	return 0;
+}
+
+/*
+ * Post a completion for an op whose active_count was already reserved at arm
+ * time (armed timers and link timeouts). Unlike post_synthetic_completion it
+ * does not increment active_count; on PQCS failure it undoes the reservation and
+ * frees the op. Must be called without timers.lock held.
+ */
+static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
+{
+	op->is_synthetic = true;
+	op->error_code = error_code;
+	op->bytes_transferred = 0;
+
+	MemoryBarrier();
+
+	if (!PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped)) {
+		atomic_fetch_sub(&ctx->active_count, 1);
+		free_op(ctx, op);
+	}
 }
 
 static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
@@ -888,6 +918,25 @@ static ior_iocp_op *timer_heap_pop(timer_mgr *tm)
 	return op;
 }
 
+/* Remove a specific op from the heap (O(n) search). Returns true if found. */
+static bool timer_heap_remove(timer_mgr *tm, ior_iocp_op *op)
+{
+	for (uint32_t i = 0; i < tm->heap_len; i++) {
+		if (tm->heap[i] != op) {
+			continue;
+		}
+		tm->heap_len--;
+		if (i < tm->heap_len) {
+			tm->heap[i] = tm->heap[tm->heap_len];
+			// Restore heap order from i: try down, then up.
+			timer_heap_sift_down(tm, i);
+			timer_heap_sift_up(tm, i);
+		}
+		return true;
+	}
+	return false;
+}
+
 static ior_iocp_op *timer_heap_peek(timer_mgr *tm)
 {
 	if (tm->heap_len == 0) {
@@ -930,6 +979,22 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 
 		op = timer_heap_pop(tm);
 		op->timer_armed = false;
+
+		if (op->guarded) {
+			/*
+			 * Link timeout fired first: this side won the arbitration (we cleared
+			 * timer_armed under the lock, so the completion path will leave the
+			 * pair to us). Cancel the in-flight guarded op - its -ECANCELED
+			 * completion arrives through the normal IOCP path - and post this
+			 * link timeout as -ETIME.
+			 */
+			ior_iocp_op *guarded = op->guarded;
+			LeaveCriticalSection(&tm->lock);
+			CancelIoEx((HANDLE) guarded->fd, &guarded->overlapped);
+			post_armed_op(ctx, op, ERROR_TIMEOUT);
+			EnterCriticalSection(&tm->lock);
+			continue;
+		}
 
 		op->is_synthetic = true;
 		op->error_code = ERROR_TIMEOUT;
@@ -986,6 +1051,38 @@ static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 
 	return 0;
+}
+
+/*
+ * Arm the link timeout guarding an op that has just been issued (and is now
+ * in-flight). Reserves an active_count slot, like arm_timer, so post_armed_op
+ * balances it on resolution. On a heap-allocation failure the link timeout is
+ * completed immediately as -ECANCELED.
+ */
+static void arm_link_timeout(ior_ctx_iocp *ctx, ior_iocp_op *guarded)
+{
+	ior_iocp_op *lt = guarded->link_timeout;
+	timer_mgr *tm = &ctx->timers;
+
+	uint64_t deadline = lt->timeout_ts
+			? qpc_deadline_from_timespec(lt->timeout_ts, lt->timeout_flags)
+			: qpc_now_ns();
+
+	EnterCriticalSection(&tm->lock);
+	lt->timer_deadline_ns = deadline;
+	lt->timer_armed = true;
+	int ret = timer_heap_push(tm, lt);
+	if (ret == 0) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		WakeConditionVariable(&tm->cv);
+	} else {
+		lt->timer_armed = false;
+	}
+	LeaveCriticalSection(&tm->lock);
+
+	if (ret < 0) {
+		(void) post_synthetic_completion(ctx, lt, ERROR_OPERATION_ABORTED, 0);
+	}
 }
 
 /* ================= LINK/DRAIN core ================= */
@@ -1101,31 +1198,48 @@ static int start_link_next(ior_ctx_iocp *ctx, ior_iocp_op *next)
 
 static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
+	int ret;
 	switch (op->opcode) {
 		case IOR_OP_NOP:
 			return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
 
 		case IOR_OP_READ:
-			return issue_read(ctx, op);
+			ret = issue_read(ctx, op);
+			break;
 
 		case IOR_OP_WRITE:
-			return issue_write(ctx, op);
+			ret = issue_write(ctx, op);
+			break;
 
 		case IOR_OP_SPLICE:
 			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
 
 		case IOR_OP_SEND:
-			return issue_send(ctx, op);
+			ret = issue_send(ctx, op);
+			break;
 
 		case IOR_OP_RECV:
-			return issue_recv(ctx, op);
+			ret = issue_recv(ctx, op);
+			break;
 
 		case IOR_OP_TIMER:
+			return arm_timer(ctx, op);
+
+		case IOR_OP_LINK_TIMEOUT:
+			// A paired link timeout is armed via its guarded op, never issued
+			// directly. Reaching here means it was unpaired - treat as a plain
+			// timeout so it still completes with -ETIME.
 			return arm_timer(ctx, op);
 
 		default:
 			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
 	}
+
+	// The guarded op is now in flight; arm its link-timeout watchdog.
+	if (ret == 0 && op->link_timeout) {
+		arm_link_timeout(ctx, op);
+	}
+	return ret;
 }
 
 /* ================= Backend ops ================= */
@@ -1413,6 +1527,13 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		// Assign submission sequence
 		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
 
+		// A link timeout already paired with its guarded op is armed when that
+		// op is issued, not submitted as a standalone op. Skip it here.
+		if (op->opcode == IOR_OP_LINK_TIMEOUT && op->guarded) {
+			prev = op;
+			continue;
+		}
+
 		// DRAIN barrier means "wait for all prior completions"
 		if (op->sqe_flags & IOR_SQE_IO_DRAIN) {
 			op->drain_after = op->seq - 1;
@@ -1426,6 +1547,16 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 			op->linked_deferred = true;
 		} else {
 			op->linked_deferred = false;
+		}
+
+		// Pair a guarded op with an immediately following link timeout: the
+		// link timeout watchdogs this op rather than chaining after it.
+		if (op->sqe_flags & IOR_SQE_IO_LINK && ctx->sq_head != ctx->sq_tail) {
+			ior_iocp_op *nxt = ctx->sq_array[ctx->sq_head];
+			if (nxt->opcode == IOR_OP_LINK_TIMEOUT && !nxt->guarded) {
+				op->link_timeout = nxt;
+				nxt->guarded = op;
+			}
 		}
 
 		// Decide whether to issue now
@@ -1541,6 +1672,31 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 			(void) start_link_next(ctx, next);
 		} else {
 			cancel_link_chain(ctx, next);
+		}
+	}
+
+	/*
+	 * Linked-timeout arbitration: if this completed op was guarded by a link
+	 * timeout, resolve the pair. Whoever finds the timeout still armed (under
+	 * timers.lock) owns posting it. If it is already disarmed, the timer thread
+	 * fired first and has handled both sides, so we do nothing here (this op's
+	 * own completion is the -ECANCELED produced by that CancelIoEx).
+	 */
+	if (op->link_timeout) {
+		ior_iocp_op *lt = op->link_timeout;
+		op->link_timeout = NULL;
+
+		EnterCriticalSection(&ctx->timers.lock);
+		bool won = lt->timer_armed;
+		if (won) {
+			lt->timer_armed = false;
+			timer_heap_remove(&ctx->timers, lt);
+		}
+		LeaveCriticalSection(&ctx->timers.lock);
+
+		if (won) {
+			// Guarded op finished before the deadline: cancel the link timeout.
+			post_armed_op(ctx, lt, ERROR_OPERATION_ABORTED);
 		}
 	}
 
@@ -1875,6 +2031,16 @@ static void ior_iocp_backend_prep_timeout(
 	(void) count;
 }
 
+static void ior_iocp_backend_prep_link_timeout(ior_sqe *sqe, ior_timespec *ts, unsigned flags)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_LINK_TIMEOUT;
+	op->fd = NULL;
+	op->timeout_ts = ts;
+	op->timeout_flags = flags;
+}
+
 static void ior_iocp_backend_prep_send(
 		ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
 {
@@ -1962,6 +2128,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_write = ior_iocp_backend_prep_write,
 	.prep_splice = ior_iocp_backend_prep_splice,
 	.prep_timeout = ior_iocp_backend_prep_timeout,
+	.prep_link_timeout = ior_iocp_backend_prep_link_timeout,
 	.prep_send = ior_iocp_backend_prep_send,
 	.prep_recv = ior_iocp_backend_prep_recv,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,

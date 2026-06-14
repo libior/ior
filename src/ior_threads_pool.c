@@ -14,6 +14,8 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <poll.h>
+#include <limits.h>
 
 #ifndef __linux__
 typedef off_t loff_t;
@@ -24,6 +26,8 @@ static void *ior_threads_pool_worker_thread_func(void *arg);
 static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_position);
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe);
+static void ior_threads_pool_process_single_sqe_timed(
+		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, int timeout_ms);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static int ior_threads_pool_try_create_thread(ior_threads_pool *pool);
 static void *ior_threads_pool_timer_thread_func(void *arg);
@@ -426,6 +430,60 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 			break;
 		}
 
+		/*
+		 * Linked timeout: if this op is linked and the next submitted SQE is a
+		 * link timeout, run the guarded op bounded by the timeout's deadline
+		 * (poll-gated) so it can be cancelled. We then complete both the guarded
+		 * op and the link timeout, which is the tail of the chain.
+		 *
+		 * Reading the next slot is safe (it was submitted together with this op);
+		 * only its processing must be claimed via pick_sqe. This mirrors the
+		 * existing LINK handling, which assumes one worker drains the chain.
+		 */
+		if (has_link) {
+			uint32_t sq_tail = atomic_load_explicit(&ctx->sq_ring.tail, memory_order_acquire);
+			uint32_t lt_pos = (uint32_t) (current_position + 1);
+			if (lt_pos != sq_tail) {
+				ior_sqe *sqes = (ior_sqe *) ctx->sq_ring.entries;
+				ior_sqe *lt = &sqes[lt_pos & ctx->sq_ring.mask];
+				if (lt->threads.opcode == IOR_OP_LINK_TIMEOUT) {
+					ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->threads.addr;
+					uint64_t lt_user_data = lt->threads.user_data;
+
+					int timeout_ms = -1;
+					if (ts) {
+						uint64_t ms = (uint64_t) ts->tv_sec * 1000
+								+ ((uint64_t) ts->tv_nsec + 999999ULL) / 1000000ULL;
+						timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
+					}
+
+					ior_cqe gcqe;
+					ior_threads_pool_process_single_sqe_timed(
+							pool, &sqe_copy, &gcqe, timeout_ms);
+					int cancelled = (gcqe.threads.res == -ECANCELED);
+					ior_threads_pool_post_completion(pool, &gcqe);
+					ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
+					count++;
+
+					// Claim the link-timeout slot and complete it: -ETIME if it
+					// cancelled the guarded op, else -ECANCELED (op finished first).
+					uint64_t lt_position = 0;
+					ior_sqe *picked_lt = ior_threads_ring_pick_sqe(&ctx->sq_ring, &lt_position);
+
+					ior_cqe lcqe;
+					memset(&lcqe, 0, sizeof(lcqe));
+					lcqe.threads.user_data = lt_user_data;
+					lcqe.threads.res = cancelled ? -ETIME : -ECANCELED;
+					ior_threads_pool_post_completion(pool, &lcqe);
+					if (picked_lt) {
+						ior_threads_ring_complete_sqe(&ctx->sq_ring, lt_position);
+						count++;
+					}
+					break;
+				}
+			}
+		}
+
 		// Process this SQE
 		ior_cqe cqe;
 		ior_threads_pool_process_single_sqe(pool, &sqe_copy, &cqe);
@@ -455,6 +513,50 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 	atomic_fetch_add(&pool->tasks_completed, count);
 
 	return count;
+}
+
+/*
+ * Run a guarded op bounded by a link timeout. For read/recv (POLLIN) and
+ * write/send (POLLOUT) on pollable descriptors, wait for readiness up to
+ * timeout_ms; on timeout the op is cancelled with -ECANCELED. Other opcodes
+ * cannot be poll-gated and run to completion unbounded (the link timeout then
+ * resolves as "op finished first"). On a regular file the poll returns ready
+ * immediately, so the op runs uncancelled - matching io_uring.
+ */
+static void ior_threads_pool_process_single_sqe_timed(
+		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, int timeout_ms)
+{
+	short events;
+	switch (sqe->threads.opcode) {
+		case IOR_OP_READ:
+		case IOR_OP_RECV:
+			events = POLLIN;
+			break;
+		case IOR_OP_WRITE:
+		case IOR_OP_SEND:
+			events = POLLOUT;
+			break;
+		default:
+			ior_threads_pool_process_single_sqe(pool, sqe, cqe);
+			return;
+	}
+
+	struct pollfd pfd = { .fd = sqe->threads.fd, .events = events };
+	int pret;
+	do {
+		pret = poll(&pfd, 1, timeout_ms);
+	} while (pret < 0 && errno == EINTR);
+
+	if (pret > 0) {
+		// Ready: the syscall will not block significantly.
+		ior_threads_pool_process_single_sqe(pool, sqe, cqe);
+		return;
+	}
+
+	memset(cqe, 0, sizeof(*cqe));
+	cqe->threads.user_data = sqe->threads.user_data;
+	// pret == 0 is the deadline (cancel); pret < 0 is a poll error.
+	cqe->threads.res = (pret == 0) ? -ECANCELED : -errno;
 }
 
 static void ior_threads_pool_process_single_sqe(
@@ -561,6 +663,13 @@ static void ior_threads_pool_process_single_sqe(
 			IOR_LOG_TRACE("recv end: res=%d", cqe->threads.res);
 			break;
 		}
+
+		case IOR_OP_LINK_TIMEOUT:
+			// A link timeout is normally consumed alongside its guarded op in
+			// process_sqe_chain. Reaching here means it was picked standalone;
+			// resolve it as "guarded op already finished" rather than failing.
+			cqe->threads.res = -ECANCELED;
+			break;
 
 		case IOR_OP_ACCEPT:
 		case IOR_OP_CONNECT:

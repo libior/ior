@@ -188,6 +188,13 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
 	}
 }
 
+void ior_prep_link_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned flags)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_link_timeout(sqe, ts, flags);
+	}
+}
+
 void ior_prep_send(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
 {

@@ -95,6 +95,8 @@ typedef struct ior_timespec {
 #define IOR_OP_SEND 9
 /** Receive from a socket (ior_prep_recv). */
 #define IOR_OP_RECV 10
+/** Timeout that cancels the preceding linked op (ior_prep_link_timeout). */
+#define IOR_OP_LINK_TIMEOUT 11
 /** @} */
 
 /**
@@ -408,6 +410,28 @@ void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in
  * @param flags  Timeout flags (e.g. absolute time). Ignored where unsupported.
  */
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
+
+/**
+ * Prepare a timeout linked to the preceding operation.
+ *
+ * Acts as a deadline/watchdog on a single operation. To use it, submit the
+ * guarded operation with the IOR_SQE_IO_LINK flag and make this link timeout the
+ * immediately following submission entry. Both entries always produce a CQE:
+ *   - if @p ts elapses first, the guarded op is cancelled (its CQE has
+ *     res == -ECANCELED) and this link timeout completes with res == -ETIME;
+ *   - if the guarded op finishes first, it reports its normal result and this
+ *     link timeout completes with res == -ECANCELED.
+ *
+ * On the threads backend, cancellation is effective for read/write/send/recv on
+ * pollable descriptors (sockets, pipes); a guarded op on a regular file runs to
+ * completion uncancelled.
+ *
+ * @param ctx    I/O context.
+ * @param sqe    Entry from ior_get_sqe(), submitted right after the guarded op.
+ * @param ts     Relative duration after which the guarded op is cancelled.
+ * @param flags  Reserved; must be 0.
+ */
+void ior_prep_link_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned flags);
 
 /**
  * Prepare a send on a connected socket.

@@ -25,6 +25,7 @@ set(TESTS
     test_edge
     test_socket
     test_concurrency
+    test_link_timeout
 )
 
 # Add test for splice only on Linux with splice support

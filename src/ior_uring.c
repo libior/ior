@@ -236,6 +236,13 @@ static void ior_uring_backend_prep_timeout(
 	io_uring_prep_timeout(s, (struct __kernel_timespec *) ts, count, flags);
 }
 
+static void ior_uring_backend_prep_link_timeout(ior_sqe *sqe, ior_timespec *ts, unsigned flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	// flags is reserved (must be 0); link-timeout semantics are handled by the kernel.
+	io_uring_prep_link_timeout(s, (struct __kernel_timespec *) ts, flags);
+}
+
 static void ior_uring_backend_prep_send(
 		ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags)
 {
@@ -334,6 +341,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_write = ior_uring_backend_prep_write,
 	.prep_splice = ior_uring_backend_prep_splice,
 	.prep_timeout = ior_uring_backend_prep_timeout,
+	.prep_link_timeout = ior_uring_backend_prep_link_timeout,
 	.prep_send = ior_uring_backend_prep_send,
 	.prep_recv = ior_uring_backend_prep_recv,
 	.sqe_set_data = ior_uring_backend_sqe_set_data,
