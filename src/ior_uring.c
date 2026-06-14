@@ -243,7 +243,8 @@ static void ior_uring_backend_prep_timeout(
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
 
-	io_uring_prep_timeout(s, (struct __kernel_timespec *) ts, count, ior_uring_timeout_flags(flags));
+	io_uring_prep_timeout(
+			s, (struct __kernel_timespec *) ts, count, ior_uring_timeout_flags(flags));
 }
 
 static void ior_uring_backend_prep_link_timeout(ior_sqe *sqe, ior_timespec *ts, unsigned flags)

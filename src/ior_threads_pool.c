@@ -453,7 +453,8 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 
 					int timeout_ms = -1;
 					if (ts) {
-						uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+						uint64_t ns
+								= (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
 						if (lt->threads.timeout_flags & IOR_TIMEOUT_ABS) {
 							// Absolute deadline: convert to remaining time from now.
 							uint64_t now = ior_threads_pool_monotonic_ns();
