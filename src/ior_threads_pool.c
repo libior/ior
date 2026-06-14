@@ -458,8 +458,7 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 					}
 
 					ior_cqe gcqe;
-					ior_threads_pool_process_single_sqe_timed(
-							pool, &sqe_copy, &gcqe, timeout_ms);
+					ior_threads_pool_process_single_sqe_timed(pool, &sqe_copy, &gcqe, timeout_ms);
 					int cancelled = (gcqe.threads.res == -ECANCELED);
 					ior_threads_pool_post_completion(pool, &gcqe);
 					ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
