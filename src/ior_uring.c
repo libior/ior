@@ -228,19 +228,28 @@ static void ior_uring_backend_prep_splice(ior_sqe *sqe, ior_fd_t fd_in, uint64_t
 	io_uring_prep_splice(s, (int) fd_in, off_in, (int) fd_out, off_out, nbytes, flags);
 }
 
+// Map ior's public timeout flags to liburing's IORING_TIMEOUT_* flags.
+static unsigned ior_uring_timeout_flags(unsigned flags)
+{
+	unsigned uflags = 0;
+	if (flags & IOR_TIMEOUT_ABS) {
+		uflags |= IORING_TIMEOUT_ABS;
+	}
+	return uflags;
+}
+
 static void ior_uring_backend_prep_timeout(
 		ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
 
-	io_uring_prep_timeout(s, (struct __kernel_timespec *) ts, count, flags);
+	io_uring_prep_timeout(s, (struct __kernel_timespec *) ts, count, ior_uring_timeout_flags(flags));
 }
 
 static void ior_uring_backend_prep_link_timeout(ior_sqe *sqe, ior_timespec *ts, unsigned flags)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
-	// flags is reserved (must be 0); link-timeout semantics are handled by the kernel.
-	io_uring_prep_link_timeout(s, (struct __kernel_timespec *) ts, flags);
+	io_uring_prep_link_timeout(s, (struct __kernel_timespec *) ts, ior_uring_timeout_flags(flags));
 }
 
 static void ior_uring_backend_prep_send(

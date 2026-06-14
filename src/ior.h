@@ -128,6 +128,16 @@ typedef struct ior_timespec {
 #define IOR_SQE_ASYNC (1U << 3)
 /** @} */
 
+/**
+ * @name Timeout flags
+ * Bits for the flags argument of ior_prep_timeout() and ior_prep_link_timeout().
+ * @{
+ */
+/** Interpret the timespec as an absolute deadline on the monotonic clock
+ *  rather than a relative duration. */
+#define IOR_TIMEOUT_ABS (1U << 0)
+/** @} */
+
 /** Asynchronous I/O backend implementation. */
 typedef enum {
 	/** Auto-select the best backend for the platform. */
@@ -403,11 +413,12 @@ void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in
  *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe().
- * @param ts     Relative duration to wait.
+ * @param ts     Timeout value: a relative duration, or an absolute monotonic
+ *               deadline if IOR_TIMEOUT_ABS is set in @p flags.
  * @param count  Number of completions to wait for before the timeout fires
  *               (io_uring semantics; 0 = a pure time-based timeout). Ignored by
  *               backends that do not support it.
- * @param flags  Timeout flags (e.g. absolute time). Ignored where unsupported.
+ * @param flags  IOR_TIMEOUT_ABS to treat @p ts as an absolute deadline, else 0.
  */
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
 
@@ -428,8 +439,10 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe(), submitted right after the guarded op.
- * @param ts     Relative duration after which the guarded op is cancelled.
- * @param flags  Reserved; must be 0.
+ * @param ts     Deadline after which the guarded op is cancelled: a relative
+ *               duration, or an absolute monotonic deadline if IOR_TIMEOUT_ABS
+ *               is set in @p flags.
+ * @param flags  IOR_TIMEOUT_ABS to treat @p ts as an absolute deadline, else 0.
  */
 void ior_prep_link_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned flags);
 

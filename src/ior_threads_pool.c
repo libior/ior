@@ -33,6 +33,7 @@ static int ior_threads_pool_try_create_thread(ior_threads_pool *pool);
 static void *ior_threads_pool_timer_thread_func(void *arg);
 static void ior_threads_pool_arm_timer(
 		ior_threads_pool *pool, const ior_sqe *sqe, uint64_t position);
+static uint64_t ior_threads_pool_monotonic_ns(void);
 #ifndef IOR_HAVE_SPLICE
 static ssize_t ior_threads_pool_emulate_splice(
 		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);
@@ -452,8 +453,13 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 
 					int timeout_ms = -1;
 					if (ts) {
-						uint64_t ms = (uint64_t) ts->tv_sec * 1000
-								+ ((uint64_t) ts->tv_nsec + 999999ULL) / 1000000ULL;
+						uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+						if (lt->threads.timeout_flags & IOR_TIMEOUT_ABS) {
+							// Absolute deadline: convert to remaining time from now.
+							uint64_t now = ior_threads_pool_monotonic_ns();
+							ns = (ns > now) ? ns - now : 0;
+						}
+						uint64_t ms = (ns + 999999ULL) / 1000000ULL;
 						timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
 					}
 
@@ -844,9 +850,15 @@ static void ior_threads_pool_arm_timer(
 	}
 
 	if (!err) {
+		// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
+		// it is a relative duration from now.
+		uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+		uint64_t deadline_ns = (sqe->threads.timeout_flags & IOR_TIMEOUT_ABS)
+				? ts_ns
+				: ior_threads_pool_monotonic_ns() + ts_ns;
+
 		ior_threads_pool_timer timer = {
-			.deadline_ns = ior_threads_pool_monotonic_ns() + (uint64_t) ts->tv_sec * 1000000000ULL
-					+ (uint64_t) ts->tv_nsec,
+			.deadline_ns = deadline_ns,
 			.position = position,
 			.user_data = sqe->threads.user_data,
 		};

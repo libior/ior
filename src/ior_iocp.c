@@ -30,10 +30,9 @@
 #define ETIME 62 // Match Linux value
 #endif
 
-// Timeout flag: if set, the timespec is an absolute timestamp
-#ifndef IOR_TIMEOUT_ABS
-#define IOR_TIMEOUT_ABS (1U << 0)
-#endif
+// IOR_TIMEOUT_ABS comes from ior.h. qpc_deadline_from_timespec() honors it, so
+// the plain timer and the link timeout both interpret an absolute deadline
+// against the QPC monotonic clock.
 
 /*
  * Handle tracking for IOCP association

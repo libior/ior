@@ -23,6 +23,22 @@
 #include <sys/socket.h>
 #endif
 
+uint64_t test_monotonic_now_ns(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER counter, freq;
+	QueryPerformanceCounter(&counter);
+	QueryPerformanceFrequency(&freq);
+	uint64_t c = (uint64_t) counter.QuadPart;
+	uint64_t f = (uint64_t) freq.QuadPart;
+	return (c / f) * 1000000000ULL + ((c % f) * 1000000000ULL) / f;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+#endif
+}
+
 int setup_ior_ctx(void **state)
 {
 	test_state *ts = calloc(1, sizeof(test_state));

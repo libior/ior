@@ -165,11 +165,47 @@ static void test_link_timeout_op_first(void **state)
 	assert_int_equal(res_tmo, -ECANCELED);
 }
 
+/* Timer wins with an absolute deadline (IOR_TIMEOUT_ABS): same outcome as the
+ * relative case, exercising the abs path of the link timeout. */
+static void test_link_timeout_fires_abs(void **state)
+{
+	lt_state *s = (lt_state *) *state;
+	char buf[64];
+	memset(buf, 0, sizeof(buf));
+
+	ior_sqe *r = ior_get_sqe(s->ctx);
+	assert_non_null(r);
+	ior_prep_recv(s->ctx, r, s->sock[1], buf, sizeof(buf), 0);
+	ior_sqe_set_data(s->ctx, r, TAG_OP);
+	ior_sqe_set_flags(s->ctx, r, IOR_SQE_IO_LINK);
+
+	uint64_t deadline = test_monotonic_now_ns() + 50000000ULL; /* now + 50ms */
+	ior_timespec abs = {
+		.tv_sec = (int64_t) (deadline / 1000000000ULL),
+		.tv_nsec = (long long) (deadline % 1000000000ULL),
+	};
+
+	ior_sqe *t = ior_get_sqe(s->ctx);
+	assert_non_null(t);
+	ior_prep_link_timeout(s->ctx, t, &abs, IOR_TIMEOUT_ABS);
+	ior_sqe_set_data(s->ctx, t, TAG_TMO);
+
+	int ret = ior_submit_and_wait(s->ctx, 2);
+	assert_true(ret >= 0);
+
+	int32_t res_op = 0, res_tmo = 0;
+	reap_pair(s->ctx, &res_op, &res_tmo);
+
+	assert_int_equal(res_op, -ECANCELED);
+	assert_true(res_tmo == -ETIME || res_tmo == -ETIMEDOUT);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test_setup_teardown(test_link_timeout_fires, setup_lt, teardown_lt),
 		cmocka_unit_test_setup_teardown(test_link_timeout_op_first, setup_lt, teardown_lt),
+		cmocka_unit_test_setup_teardown(test_link_timeout_fires_abs, setup_lt, teardown_lt),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

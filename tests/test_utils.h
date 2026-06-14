@@ -73,6 +73,13 @@ int test_fd_is_valid(ior_fd_t fd);
  */
 int test_make_socketpair(ior_fd_t fds[2]);
 
+/*
+ * Current value of the monotonic clock the backends use for absolute timeouts
+ * (IOR_TIMEOUT_ABS), in nanoseconds: CLOCK_MONOTONIC on POSIX, QPC on Windows.
+ * Used by tests to build an absolute deadline in the backend's own clock base.
+ */
+uint64_t test_monotonic_now_ns(void);
+
 #ifdef IOR_HAVE_IOCP
 /*
  * IOCP-only helpers (Windows). These open overlapped handles with

@@ -62,11 +62,45 @@ static void test_wait_cqe_timeout(void **state)
 	// We can just exit the context to cancel it
 }
 
+/*
+ * Absolute timeout: an IOR_TIMEOUT_ABS timeout whose deadline is now + 100ms (in
+ * the backend's monotonic clock) must fire with -ETIME. This also discriminates
+ * abs from relative handling: the absolute deadline is ~uptime seconds, so if it
+ * were (mis)treated as a relative duration the wait would far exceed the test
+ * timeout instead of completing in ~100ms.
+ */
+static void test_timeout_abs(void **state)
+{
+	test_state *ts = (test_state *) *state;
+
+	uint64_t deadline = test_monotonic_now_ns() + 100000000ULL; /* now + 100ms */
+	ior_timespec abs = {
+		.tv_sec = (int64_t) (deadline / 1000000000ULL),
+		.tv_nsec = (long long) (deadline % 1000000000ULL),
+	};
+
+	ior_sqe *sqe = ior_get_sqe(ts->ctx);
+	assert_non_null(sqe);
+	ior_prep_timeout(ts->ctx, sqe, &abs, 0, IOR_TIMEOUT_ABS);
+	ior_sqe_set_data(ts->ctx, sqe, NULL);
+
+	int ret = ior_submit_and_wait(ts->ctx, 1);
+	assert_true(ret >= 0);
+
+	ior_cqe *cqe;
+	ret = ior_wait_cqe(ts->ctx, &cqe);
+	assert_return_code(ret, 0);
+	int32_t res = ior_cqe_get_res(ts->ctx, cqe);
+	assert_true(res == -ETIME || res == -ETIMEDOUT);
+	ior_cqe_seen(ts->ctx, cqe);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test_setup_teardown(test_timeout_basic, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_wait_cqe_timeout, setup_ior_ctx, teardown_ior_ctx),
+		cmocka_unit_test_setup_teardown(test_timeout_abs, setup_ior_ctx, teardown_ior_ctx),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);
