@@ -111,6 +111,7 @@ endfunction()
 
 # Build options
 option(IOR_BUILD_TESTS "Build test programs" ON)
+option(IOR_BUILD_BENCH "Build the ior_bench benchmark tool" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
 option(IOR_FORCE_THREADS "Force thread backend even if io_uring available (testing)" OFF)
 option(IOR_FORCE_PIPE "Force pipe for thread event notification (testing)" OFF)
@@ -334,6 +335,12 @@ if(IOR_BUILD_TESTS)
     else()
         message(WARNING "cmocka not found - tests disabled")
     endif()
+endif()
+
+# Benchmark tool (no cmocka dependency; registers its own smoke CTest).
+if(IOR_BUILD_BENCH)
+    enable_testing()
+    add_subdirectory(bench)
 endif()
 
 # Installation
