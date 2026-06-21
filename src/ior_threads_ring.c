@@ -196,6 +196,17 @@ ior_sqe *ior_threads_ring_pick_sqe(ior_threads_ring *ring, uint64_t *sqe_positio
 	return &((ior_sqe *) ring->entries)[index];
 }
 
+int ior_threads_ring_claim_position(ior_threads_ring *ring, uint64_t position)
+{
+	if (!ring || !ring->is_sq) {
+		return 0;
+	}
+
+	uint32_t expected = (uint32_t) position;
+	return atomic_compare_exchange_strong_explicit(
+			&ring->picked, &expected, expected + 1, memory_order_acq_rel, memory_order_relaxed);
+}
+
 void ior_threads_ring_complete_sqe(ior_threads_ring *ring, uint64_t sqe_position)
 {
 	if (!ring || !ring->is_sq) {

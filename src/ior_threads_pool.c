@@ -432,14 +432,9 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 		}
 
 		/*
-		 * Linked timeout: if this op is linked and the next submitted SQE is a
-		 * link timeout, run the guarded op bounded by the timeout's deadline
-		 * (poll-gated) so it can be cancelled. We then complete both the guarded
-		 * op and the link timeout, which is the tail of the chain.
-		 *
-		 * Reading the next slot is safe (it was submitted together with this op);
-		 * only its processing must be claimed via pick_sqe. This mirrors the
-		 * existing LINK handling, which assumes one worker drains the chain.
+		 * Linked timeout: if this op is linked and the next submitted SQE is a link timeout, run
+		 * the guarded op bounded by the timeout's deadline (poll-gated) so it can be cancelled,
+		 * then complete both the guarded op and the link timeout (the tail of the chain).
 		 */
 		if (has_link) {
 			uint32_t sq_tail = atomic_load_explicit(&ctx->sq_ring.tail, memory_order_acquire);
@@ -450,42 +445,51 @@ static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t s
 				if (lt->threads.opcode == IOR_OP_LINK_TIMEOUT) {
 					ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->threads.addr;
 					uint64_t lt_user_data = lt->threads.user_data;
+					unsigned lt_flags = lt->threads.timeout_flags;
 
-					int timeout_ms = -1;
-					if (ts) {
-						uint64_t ns
-								= (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-						if (lt->threads.timeout_flags & IOR_TIMEOUT_ABS) {
-							// Absolute deadline: convert to remaining time from now.
-							uint64_t now = ior_threads_pool_monotonic_ns();
-							ns = (ns > now) ? ns - now : 0;
+					/*
+					 * Claim the link-timeout slot's exact position now, before running the
+					 * (poll-gated, possibly slow) guarded op, so this worker alone owns it and
+					 * posts/completes it exactly once. If another worker already claimed it, run
+					 * the guarded op unguarded and let that worker resolve the link timeout.
+					 */
+					if (ior_threads_ring_claim_position(&ctx->sq_ring, lt_pos)) {
+						int timeout_ms = -1;
+						if (ts) {
+							uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL
+									+ (uint64_t) ts->tv_nsec;
+							if (lt_flags & IOR_TIMEOUT_ABS) {
+								// Absolute deadline: convert to remaining time from now.
+								uint64_t now = ior_threads_pool_monotonic_ns();
+								ns = (ns > now) ? ns - now : 0;
+							}
+							uint64_t ms = (ns + 999999ULL) / 1000000ULL;
+							timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
 						}
-						uint64_t ms = (ns + 999999ULL) / 1000000ULL;
-						timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
-					}
 
-					ior_cqe gcqe;
-					ior_threads_pool_process_single_sqe_timed(pool, &sqe_copy, &gcqe, timeout_ms);
-					int cancelled = (gcqe.threads.res == -ECANCELED);
-					ior_threads_pool_post_completion(pool, &gcqe);
-					ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
-					count++;
-
-					// Claim the link-timeout slot and complete it: -ETIME if it
-					// cancelled the guarded op, else -ECANCELED (op finished first).
-					uint64_t lt_position = 0;
-					ior_sqe *picked_lt = ior_threads_ring_pick_sqe(&ctx->sq_ring, &lt_position);
-
-					ior_cqe lcqe;
-					memset(&lcqe, 0, sizeof(lcqe));
-					lcqe.threads.user_data = lt_user_data;
-					lcqe.threads.res = cancelled ? -ETIME : -ECANCELED;
-					ior_threads_pool_post_completion(pool, &lcqe);
-					if (picked_lt) {
-						ior_threads_ring_complete_sqe(&ctx->sq_ring, lt_position);
+						ior_cqe gcqe;
+						ior_threads_pool_process_single_sqe_timed(
+								pool, &sqe_copy, &gcqe, timeout_ms);
+						int cancelled = (gcqe.threads.res == -ECANCELED);
+						ior_threads_pool_post_completion(pool, &gcqe);
+						ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
 						count++;
+
+						// -ETIME if the timeout cancelled the guarded op, else -ECANCELED (the
+						// guarded op finished first).
+						ior_cqe lcqe;
+						memset(&lcqe, 0, sizeof(lcqe));
+						lcqe.threads.user_data = lt_user_data;
+						lcqe.threads.res = cancelled ? -ETIME : -ECANCELED;
+						ior_threads_pool_post_completion(pool, &lcqe);
+						ior_threads_ring_complete_sqe(&ctx->sq_ring, lt_pos);
+						count++;
+						break;
 					}
-					break;
+
+					// The link-timeout slot is owned by another worker; run the guarded op as a
+					// plain op and do not continue the chain (its only successor is that timeout).
+					has_link = 0;
 				}
 			}
 		}

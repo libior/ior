@@ -74,6 +74,12 @@ void ior_threads_ring_submit(ior_threads_ring *ring);
 // Pick next SQE for processing (increments picked, returns position)
 ior_sqe *ior_threads_ring_pick_sqe(ior_threads_ring *ring, uint64_t *sqe_position);
 
+// Claim one specific position iff it is still the next unpicked slot
+// (picked == position). Returns 1 on success (picked advanced past it), 0 if
+// another worker already claimed it. Lets the worker draining a link chain bind
+// the link-timeout slot to itself so no other worker can pick it concurrently.
+int ior_threads_ring_claim_position(ior_threads_ring *ring, uint64_t position);
+
 // Mark SQE at position as completed (advances head if possible, broadcasts head_cond)
 void ior_threads_ring_complete_sqe(ior_threads_ring *ring, uint64_t sqe_position);
 
