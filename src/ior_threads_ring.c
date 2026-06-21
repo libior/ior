@@ -40,29 +40,12 @@ int ior_threads_ring_init(ior_threads_ring *ring, uint32_t size, uint8_t is_sq)
 	atomic_init(&ring->head, 0);
 	atomic_init(&ring->tail, 0);
 	atomic_init(&ring->cached_tail, 0);
-	atomic_init(&ring->picked, 0);
+	atomic_init(&ring->consumed, 0);
 
-	if (is_sq) {
-		ring->completed = calloc(size, sizeof(uint8_t));
-		if (!ring->completed) {
-			free(ring->entries);
-			return -ENOMEM;
-		}
-
-		if (pthread_mutex_init(&ring->head_lock, NULL) != 0) {
-			free(ring->completed);
-			free(ring->entries);
-			return -ENOMEM;
-		}
-
-		if (pthread_cond_init(&ring->head_cond, NULL) != 0) {
-			pthread_mutex_destroy(&ring->head_lock);
-			free(ring->completed);
-			free(ring->entries);
-			return -ENOMEM;
-		}
-	} else {
-		// CQ ring: producers are serialized through tail_lock (MPSC).
+	// The SQ ring is pure staging (get_sqe/submit/consume move the cursors above,
+	// no extra state). The CQ ring serializes its multiple producers (worker
+	// threads and the timer thread) through tail_lock.
+	if (!is_sq) {
 		if (pthread_mutex_init(&ring->tail_lock, NULL) != 0) {
 			free(ring->entries);
 			return -ENOMEM;
@@ -78,11 +61,7 @@ void ior_threads_ring_destroy(ior_threads_ring *ring)
 		return;
 	}
 
-	if (ring->is_sq) {
-		pthread_cond_destroy(&ring->head_cond);
-		pthread_mutex_destroy(&ring->head_lock);
-		free(ring->completed);
-	} else {
+	if (!ring->is_sq) {
 		pthread_mutex_destroy(&ring->tail_lock);
 	}
 
@@ -102,16 +81,6 @@ uint32_t ior_threads_ring_count(ior_threads_ring *ring)
 	return tail - head;
 }
 
-uint32_t ior_threads_ring_pending_count(ior_threads_ring *ring)
-{
-	if (!ring || !ring->is_sq) {
-		return 0;
-	}
-	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
-	uint32_t cached = atomic_load_explicit(&ring->cached_tail, memory_order_acquire);
-	return cached - tail;
-}
-
 int ior_threads_ring_empty(ior_threads_ring *ring)
 {
 	return ior_threads_ring_count(ring) == 0;
@@ -128,16 +97,6 @@ int ior_threads_ring_full(ior_threads_ring *ring)
 	return (cached - head) >= ring->size;
 }
 
-uint32_t ior_threads_ring_space(ior_threads_ring *ring)
-{
-	if (!ring) {
-		return 0;
-	}
-	return ring->size
-			- (ring->is_sq ? (atomic_load(&ring->cached_tail) - atomic_load(&ring->head))
-						   : (atomic_load(&ring->tail) - atomic_load(&ring->head)));
-}
-
 // ===== Submission Queue Operations =====
 
 ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring)
@@ -146,10 +105,15 @@ ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring)
 		return NULL;
 	}
 
-	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	/*
+	 * The staging ring only holds reserved-but-not-yet-copied SQEs: submit copies
+	 * them out and advances `consumed`, so a slot is free again right after submit
+	 * regardless of how long the operation runs.
+	 */
+	uint32_t consumed = atomic_load_explicit(&ring->consumed, memory_order_acquire);
 	uint32_t cached = atomic_load_explicit(&ring->cached_tail, memory_order_relaxed);
 
-	if (cached - head >= ring->size) {
+	if (cached - consumed >= ring->size) {
 		return NULL; // Full
 	}
 
@@ -159,98 +123,14 @@ ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring)
 	return &((ior_sqe *) ring->entries)[index];
 }
 
-void ior_threads_ring_submit(ior_threads_ring *ring)
+void ior_threads_ring_consume(ior_threads_ring *ring)
 {
 	if (!ring || !ring->is_sq) {
 		return;
 	}
 
 	uint32_t cached = atomic_load_explicit(&ring->cached_tail, memory_order_acquire);
-	atomic_store_explicit(&ring->tail, cached, memory_order_release);
-}
-
-ior_sqe *ior_threads_ring_pick_sqe(ior_threads_ring *ring, uint64_t *sqe_position)
-{
-	if (!ring || !ring->is_sq) {
-		return NULL;
-	}
-
-	uint32_t picked = atomic_load_explicit(&ring->picked, memory_order_relaxed);
-	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
-
-	if (picked >= tail) {
-		return NULL; // Nothing to pick
-	}
-
-	// Atomically claim this position
-	if (!atomic_compare_exchange_strong_explicit(
-				&ring->picked, &picked, picked + 1, memory_order_acq_rel, memory_order_relaxed)) {
-		return NULL; // Another thread got it
-	}
-
-	if (sqe_position) {
-		*sqe_position = picked;
-	}
-
-	uint32_t index = picked & ring->mask;
-	return &((ior_sqe *) ring->entries)[index];
-}
-
-int ior_threads_ring_claim_position(ior_threads_ring *ring, uint64_t position)
-{
-	if (!ring || !ring->is_sq) {
-		return 0;
-	}
-
-	uint32_t expected = (uint32_t) position;
-	return atomic_compare_exchange_strong_explicit(
-			&ring->picked, &expected, expected + 1, memory_order_acq_rel, memory_order_relaxed);
-}
-
-void ior_threads_ring_complete_sqe(ior_threads_ring *ring, uint64_t sqe_position)
-{
-	if (!ring || !ring->is_sq) {
-		return;
-	}
-
-	pthread_mutex_lock(&ring->head_lock);
-
-	// Mark this position as completed
-	uint32_t index = sqe_position & ring->mask;
-	ring->completed[index] = 1;
-
-	// Try to advance head
-	uint32_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
-	uint32_t new_head = head;
-
-	// Advance head past all completed entries
-	while (ring->completed[new_head & ring->mask]) {
-		ring->completed[new_head & ring->mask] = 0; // Clear for reuse
-		new_head++;
-	}
-
-	if (new_head != head) {
-		atomic_store_explicit(&ring->head, new_head, memory_order_release);
-		pthread_cond_broadcast(&ring->head_cond); // Wake DRAIN waiters
-	}
-
-	pthread_mutex_unlock(&ring->head_lock);
-}
-
-int ior_threads_ring_wait_until_head(ior_threads_ring *ring, uint64_t position)
-{
-	if (!ring || !ring->is_sq) {
-		return -EINVAL;
-	}
-
-	pthread_mutex_lock(&ring->head_lock);
-
-	while (atomic_load_explicit(&ring->head, memory_order_acquire) < position) {
-		pthread_cond_wait(&ring->head_cond, &ring->head_lock);
-	}
-
-	pthread_mutex_unlock(&ring->head_lock);
-	return 0;
+	atomic_store_explicit(&ring->consumed, cached, memory_order_release);
 }
 
 // ===== Completion Queue Operations =====
@@ -345,56 +225,4 @@ void ior_threads_ring_advance(ior_threads_ring *ring, uint32_t count)
 
 	uint32_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
 	atomic_store_explicit(&ring->head, head + count, memory_order_release);
-}
-
-// ===== Ring Management =====
-
-int ior_threads_ring_resize(ior_threads_ring *ring, uint32_t new_size)
-{
-	if (!ring || new_size == 0 || !ior_threads_ring_is_power_of_2(new_size)) {
-		return -EINVAL;
-	}
-
-	uint32_t max = ring->is_sq ? IOR_THREADS_RING_MAX_ENTRIES : IOR_THREADS_RING_MAX_CQ_ENTRIES;
-	if (new_size > max) {
-		return -EINVAL;
-	}
-
-	uint32_t head = atomic_load(&ring->head);
-	uint32_t tail = atomic_load(&ring->tail);
-
-	if (head != tail) {
-		return -EBUSY;
-	}
-
-	void *new_entries = calloc(new_size, ring->entry_size);
-	if (!new_entries) {
-		return -ENOMEM;
-	}
-
-	uint8_t *new_completed = NULL;
-	if (ring->is_sq) {
-		new_completed = calloc(new_size, sizeof(uint8_t));
-		if (!new_completed) {
-			free(new_entries);
-			return -ENOMEM;
-		}
-	}
-
-	free(ring->entries);
-	ring->entries = new_entries;
-	ring->size = new_size;
-	ring->mask = new_size - 1;
-
-	if (ring->is_sq) {
-		free(ring->completed);
-		ring->completed = new_completed;
-	}
-
-	atomic_store(&ring->head, 0);
-	atomic_store(&ring->tail, 0);
-	atomic_store(&ring->cached_tail, 0);
-	atomic_store(&ring->picked, 0);
-
-	return 0;
 }

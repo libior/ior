@@ -101,8 +101,10 @@ static void test_link_timeout_fires(void **state)
 	assert_true(res_tmo == -ETIME || res_tmo == -ETIMEDOUT);
 }
 
-// Guarded op wins: data is already waiting, so the recv completes first and the
-// link timeout is cancelled.
+/*
+ * Guarded op wins: data is already waiting, so the recv completes first and the
+ * link timeout is cancelled.
+ */
 static void test_link_timeout_op_first(void **state)
 {
 	lt_state *s = (lt_state *) *state;
@@ -153,8 +155,10 @@ static void test_link_timeout_op_first(void **state)
 	assert_int_equal(res_tmo, -ECANCELED);
 }
 
-// Timer wins with an absolute deadline (IOR_TIMEOUT_ABS): same outcome as the
-// relative case, exercising the abs path of the link timeout.
+/*
+ * Timer wins with an absolute deadline (IOR_TIMEOUT_ABS): same outcome as the
+ * relative case, exercising the abs path of the link timeout.
+ */
 static void test_link_timeout_fires_abs(void **state)
 {
 	lt_state *s = (lt_state *) *state;
@@ -188,13 +192,15 @@ static void test_link_timeout_fires_abs(void **state)
 	assert_true(res_tmo == -ETIME || res_tmo == -ETIMEDOUT);
 }
 
-// Concurrency stress: many guarded recvs, each with its own link timeout, in
-// flight at once over many rounds. Data is pre-loaded so every guarded op wins
-// and every link timeout resolves as -ECANCELED. On the threads backend each
-// linked pair is drained by a worker that must bind the link-timeout slot to
-// itself; if that binding races, the link timeout is completed twice (a
-// duplicate CQE) or its SQ slot leaks (a missing CQE / wedged ring). Both show
-// up here as a per-tag exactly-once violation, caught quickly via bounded waits.
+/*
+ * Concurrency stress: many guarded recvs, each with its own link timeout, in
+ * flight at once over many rounds. Data is pre-loaded so every guarded op wins
+ * and every link timeout resolves as -ECANCELED. On the threads backend each
+ * linked pair is drained by a worker that must bind the link-timeout slot to
+ * itself; if that binding races, the link timeout is completed twice (a
+ * duplicate CQE) or its SQ slot leaks (a missing CQE / wedged ring). Both show
+ * up here as a per-tag exactly-once violation, caught quickly via bounded waits.
+ */
 #define LT_CONC_PAIRS 64
 #define LT_CONC_ROUNDS 200
 #define LT_CONC_MSG 8
@@ -250,9 +256,11 @@ static int teardown_lt_conc(void **state)
 	return 0;
 }
 
-// Reap exactly `n` completions, invoking on_cqe for each. Fails if one does not
-// arrive within a bounded wait, which means a completion was lost (a leaked or
-// wedged SQ slot) rather than hanging until the overall test timeout.
+/*
+ * Reap exactly `n` completions, invoking on_cqe for each. Fails if one does not
+ * arrive within a bounded wait, which means a completion was lost (a leaked or
+ * wedged SQ slot) rather than hanging until the overall test timeout.
+ */
 static void reap_exactly(ior_ctx *ctx, int n, void (*on_cqe)(ior_ctx *, ior_cqe *))
 {
 	int got = 0;
@@ -309,6 +317,8 @@ static void test_link_timeout_concurrency(void **state)
 {
 	lt_conc_state *s = (lt_conc_state *) *state;
 	const char msg[LT_CONC_MSG] = "linkstr";
+	// Stable storage: the backend keeps the timespec pointer until the op runs.
+	ior_timespec ts = { .tv_sec = 5, .tv_nsec = 0 };
 
 	for (int r = 0; r < LT_CONC_ROUNDS; r++) {
 		// Pre-load data so every guarded recv can complete immediately.
@@ -333,7 +343,6 @@ static void test_link_timeout_concurrency(void **state)
 
 			ior_sqe *tmo = ior_get_sqe(s->ctx);
 			assert_non_null(tmo);
-			ior_timespec ts = { .tv_sec = 5, .tv_nsec = 0 };
 			ior_prep_link_timeout(s->ctx, tmo, &ts, 0);
 			ior_sqe_set_data(s->ctx, tmo, lt_tag(i, 1));
 		}

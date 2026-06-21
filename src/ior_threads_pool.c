@@ -23,7 +23,7 @@ typedef off_t loff_t;
 
 // Forward declarations
 static void *ior_threads_pool_worker_thread_func(void *arg);
-static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_position);
+static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head);
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe);
 static void ior_threads_pool_process_single_sqe_timed(
@@ -31,13 +31,110 @@ static void ior_threads_pool_process_single_sqe_timed(
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static int ior_threads_pool_try_create_thread(ior_threads_pool *pool);
 static void *ior_threads_pool_timer_thread_func(void *arg);
-static void ior_threads_pool_arm_timer(
-		ior_threads_pool *pool, const ior_sqe *sqe, uint64_t position);
+static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
+static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
 static uint64_t ior_threads_pool_monotonic_ns(void);
 #ifndef IOR_HAVE_SPLICE
 static ssize_t ior_threads_pool_emulate_splice(
 		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);
 #endif
+
+// Round up to a power of two (>= 1).
+static uint32_t ior_threads_pool_round_up_pow2(uint32_t n)
+{
+	if (n < 2) {
+		return 1;
+	}
+	n--;
+	n |= n >> 1;
+	n |= n >> 2;
+	n |= n >> 4;
+	n |= n >> 8;
+	n |= n >> 16;
+	return n + 1;
+}
+
+// ===== Work-item pool, dispatch FIFO and drain tracking =====
+// All of the work-pool / dispatch helpers below must be called with pool_lock
+// held; the drain helpers take drain_lock themselves.
+
+static ior_work *ior_threads_pool_work_alloc(ior_threads_pool *pool)
+{
+	ior_work *w = pool->work_free;
+	pool->work_free = w->next;
+	return w;
+}
+
+static void ior_threads_pool_work_release(ior_threads_pool *pool, ior_work *w)
+{
+	w->next = pool->work_free;
+	pool->work_free = w;
+}
+
+static void ior_threads_pool_disp_push(ior_threads_pool *pool, ior_work *w)
+{
+	w->next = NULL;
+	if (pool->disp_tail) {
+		pool->disp_tail->next = w;
+	} else {
+		pool->disp_head = w;
+	}
+	pool->disp_tail = w;
+}
+
+static ior_work *ior_threads_pool_disp_pop(ior_threads_pool *pool)
+{
+	ior_work *w = pool->disp_head;
+	if (w) {
+		pool->disp_head = w->next;
+		if (!pool->disp_head) {
+			pool->disp_tail = NULL;
+		}
+	}
+	return w;
+}
+
+// Mark a submission sequence completed and advance the contiguous drain front,
+// waking any IO_DRAIN op waiting for earlier ops to finish.
+static void ior_threads_pool_drain_complete(ior_threads_pool *pool, uint64_t seq)
+{
+	pthread_mutex_lock(&pool->drain_lock);
+	pool->drain_done[seq & pool->drain_mask] = 1;
+	while (pool->drain_done[pool->drain_upto & pool->drain_mask]) {
+		pool->drain_done[pool->drain_upto & pool->drain_mask] = 0;
+		pool->drain_upto++;
+	}
+	pthread_cond_broadcast(&pool->drain_cond);
+	pthread_mutex_unlock(&pool->drain_lock);
+}
+
+// Block until every op submitted before `seq` has completed (for IO_DRAIN).
+static void ior_threads_pool_drain_wait(ior_threads_pool *pool, uint64_t seq)
+{
+	pthread_mutex_lock(&pool->drain_lock);
+	while (pool->drain_upto < seq) {
+		pthread_cond_wait(&pool->drain_cond, &pool->drain_lock);
+	}
+	pthread_mutex_unlock(&pool->drain_lock);
+}
+
+/*
+ * Retire one operation: post its completion, record it for drain ordering,
+ * return its work item to the pool, and drop the in-flight/outstanding counts so
+ * get_sqe and worker provisioning see the freed capacity.
+ */
+static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe)
+{
+	ior_threads_pool_post_completion(pool, cqe);
+	ior_threads_pool_drain_complete(pool, work->seq);
+
+	pthread_mutex_lock(&pool->pool_lock);
+	ior_threads_pool_work_release(pool, work);
+	pthread_mutex_unlock(&pool->pool_lock);
+
+	atomic_fetch_sub(&pool->outstanding, 1);
+	atomic_fetch_sub(&pool->num_inflight, 1);
+}
 
 ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_threads)
 {
@@ -92,6 +189,48 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	pool->threads = NULL;
 	pool->num_threads_current = 0;
 	pool->num_threads_idle = 0;
+
+	/*
+	 * Work-item pool + dispatch FIFO (free-at-submit). Capacity matches the CQ
+	 * (the in-flight bound). The drain bitmap is sized past the worst-case
+	 * in-flight seq span so sequence numbers never alias.
+	 */
+	pool->work_cap = ctx->cq_ring.size;
+	pool->work_free = NULL;
+	pool->disp_head = NULL;
+	pool->disp_tail = NULL;
+	pool->next_seq = 0;
+	atomic_init(&pool->outstanding, 0);
+	atomic_init(&pool->num_inflight, 0);
+	pool->drain_upto = 0;
+	pool->drain_done = NULL;
+
+	pool->work_items = calloc(pool->work_cap, sizeof(*pool->work_items));
+	uint32_t drain_cap = ior_threads_pool_round_up_pow2(pool->work_cap * 2);
+	pool->drain_mask = drain_cap - 1;
+	pool->drain_done = calloc(drain_cap, sizeof(*pool->drain_done));
+	if (!pool->work_items || !pool->drain_done
+			|| pthread_mutex_init(&pool->drain_lock, NULL) != 0) {
+		free(pool->drain_done);
+		free(pool->work_items);
+		pthread_cond_destroy(&pool->work_cond);
+		pthread_mutex_destroy(&pool->pool_lock);
+		free(pool);
+		return NULL;
+	}
+	if (pthread_cond_init(&pool->drain_cond, NULL) != 0) {
+		pthread_mutex_destroy(&pool->drain_lock);
+		free(pool->drain_done);
+		free(pool->work_items);
+		pthread_cond_destroy(&pool->work_cond);
+		pthread_mutex_destroy(&pool->pool_lock);
+		free(pool);
+		return NULL;
+	}
+	for (uint32_t i = 0; i < pool->work_cap; i++) {
+		pool->work_items[i].next = pool->work_free;
+		pool->work_free = &pool->work_items[i];
+	}
 
 	// Timer manager: small min-heap plus a dedicated thread.
 	pool->timer_thread_started = 0;
@@ -174,33 +313,66 @@ ior_threads_pool *ior_threads_pool_create_ex(
 
 void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 {
+	(void) count;
 	if (!pool) {
 		return;
 	}
 
-	IOR_LOG_TRACE("enter: count=%u", count);
-
-	// Submit all pending SQEs first
-	if (count > 0) {
-		ior_threads_ring_submit(&pool->ctx->sq_ring);
-	}
+	ior_ctx_threads *ctx = pool->ctx;
 
 	pthread_mutex_lock(&pool->pool_lock);
 
-	// Check if we need more threads
-	uint32_t pending = ior_threads_ring_count(&pool->ctx->sq_ring);
-	uint32_t idle = pool->num_threads_idle;
+	/*
+	 * Copy every newly staged SQE out of the ring into a work item and enqueue
+	 * it, freeing the SQ slots immediately. Consecutive IO_LINK ops form one
+	 * chain: only the head is enqueued, the rest hang off head->chain, so a
+	 * worker drains a chain as a unit (no mid-chain race).
+	 */
+	uint32_t consumed = atomic_load_explicit(&ctx->sq_ring.consumed, memory_order_relaxed);
+	uint32_t cached = atomic_load_explicit(&ctx->sq_ring.cached_tail, memory_order_acquire);
+	uint32_t n = cached - consumed;
+	const ior_sqe *sqes = (const ior_sqe *) ctx->sq_ring.entries;
 
-	// If we have pending work and no idle threads, try to create more
-	if (pending > 0 && idle == 0 && pool->num_threads_current < pool->num_threads_max) {
-		IOR_LOG_TRACE("creating thread: pending=%u, idle=%u, nthreads=%u", pending, idle,
-				pool->num_threads_current);
-		ior_threads_pool_try_create_thread(pool);
+	ior_work *prev = NULL;
+	int prev_link = 0;
+	for (uint32_t p = consumed; p != cached; p++) {
+		ior_work *w = ior_threads_pool_work_alloc(pool);
+		w->sqe = sqes[p & ctx->sq_ring.mask];
+		w->seq = pool->next_seq++;
+		w->chain = NULL;
+		int has_link = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
+		if (prev_link) {
+			prev->chain = w;
+		} else {
+			ior_threads_pool_disp_push(pool, w);
+		}
+		prev = w;
+		prev_link = has_link;
 	}
 
-	// Wake up all idle threads
+	atomic_fetch_add(&pool->num_inflight, n);
+
+	/*
+	 * Keep one worker thread per in-flight op (capped at max). A blocking op
+	 * holds its thread until it completes, so matching threads to the in-flight
+	 * count guarantees every op - including a newer one behind a blocked op - has
+	 * a thread to run it.
+	 */
+	uint32_t want = atomic_load(&pool->num_inflight);
+	if (want > pool->num_threads_max) {
+		want = pool->num_threads_max;
+	}
+	while (pool->num_threads_current < want) {
+		if (ior_threads_pool_try_create_thread(pool) != 0) {
+			break;
+		}
+	}
+
 	pthread_cond_broadcast(&pool->work_cond);
 	pthread_mutex_unlock(&pool->pool_lock);
+
+	// Staging slots are now free for reuse by get_sqe.
+	ior_threads_ring_consume(&ctx->sq_ring);
 }
 
 void ior_threads_pool_destroy(ior_threads_pool *pool)
@@ -248,6 +420,10 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	pthread_mutex_unlock(&pool->pool_lock);
 
 	// Cleanup
+	pthread_cond_destroy(&pool->drain_cond);
+	pthread_mutex_destroy(&pool->drain_lock);
+	free(pool->drain_done);
+	free(pool->work_items);
 	pthread_cond_destroy(&pool->work_cond);
 	pthread_mutex_destroy(&pool->pool_lock);
 	free(pool);
@@ -289,7 +465,6 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 {
 	ior_threads_pool_worker_thread_t *worker = (ior_threads_pool_worker_thread_t *) arg;
 	ior_threads_pool *pool = worker->pool;
-	ior_ctx_threads *ctx = pool->ctx;
 
 	struct timeval last_work_time;
 	gettimeofday(&last_work_time, NULL);
@@ -298,78 +473,48 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 	IOR_LOG_TRACE("thread created");
 
 	while (1) {
-		// Check for shutdown
-		if (atomic_load(&pool->shutdown)) {
-			break;
-		}
+		pthread_mutex_lock(&pool->pool_lock);
 
-		uint64_t sqe_position = 0;
-
-		// Try to pick work from SQ ring
-		ior_sqe *sqe = ior_threads_ring_pick_sqe(&ctx->sq_ring, &sqe_position);
-
-		if (sqe) {
-			// Got work
-			pthread_mutex_lock(&pool->pool_lock);
-			pool->num_threads_idle--;
-			IOR_LOG_TRACE("pool idle: %u", pool->num_threads_idle);
-			pthread_mutex_unlock(&pool->pool_lock);
-
-			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_ACTIVE);
-			gettimeofday(&last_work_time, NULL);
-
-			// Process SQE chain (handles LINK)
-			int processed = ior_threads_pool_process_sqe_chain(pool, sqe_position);
-
-			worker->tasks_completed += processed;
-
-			IOR_LOG_TRACE("active processing: processed=%d, total=%lu", processed,
-					worker->tasks_completed);
-
-			// Mark thread as idle again
-			pthread_mutex_lock(&pool->pool_lock);
-			pool->num_threads_idle++;
-			IOR_LOG_TRACE("pool idle: %u", pool->num_threads_idle);
-			pthread_mutex_unlock(&pool->pool_lock);
-
-			atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_IDLE);
-
-		} else {
-			// No work available
-			pthread_mutex_lock(&pool->pool_lock);
-
-			// Double-check shutdown
+		// Wait for a dispatched chain, exiting on shutdown or after being idle
+		// too long (excess thread above the minimum).
+		while (!pool->disp_head) {
 			if (atomic_load(&pool->shutdown)) {
-				IOR_LOG_TRACE("in shutdown");
 				pthread_mutex_unlock(&pool->pool_lock);
-				break;
+				return NULL;
 			}
 
-			// Check if we should exit due to being excess thread
 			struct timeval now;
 			gettimeofday(&now, NULL);
 			long idle_ms = (now.tv_sec - last_work_time.tv_sec) * 1000
 					+ (now.tv_usec - last_work_time.tv_usec) / 1000;
-
-			if (pool->num_threads_current > pool->num_threads_min && idle_ms > idle_timeout_ms) {
-				// This thread has been idle too long, exit
+			if (pool->num_threads_current > pool->num_threads_min
+					&& idle_ms > (long) idle_timeout_ms) {
 				atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_STOPPING);
 				pool->num_threads_current--;
 				pool->num_threads_idle--;
-				IOR_LOG_TRACE("stopping: threads=%u, idle=%u", pool->num_threads_current,
-						pool->num_threads_idle);
 				pthread_mutex_unlock(&pool->pool_lock);
-				break;
+				return NULL;
 			}
 
-			// Wait for work with timeout
 			struct timespec timeout;
 			timeout.tv_sec = now.tv_sec + 1;
 			timeout.tv_nsec = now.tv_usec * 1000;
-
 			pthread_cond_timedwait(&pool->work_cond, &pool->pool_lock, &timeout);
-			pthread_mutex_unlock(&pool->pool_lock);
 		}
+
+		ior_work *head = ior_threads_pool_disp_pop(pool);
+		pool->num_threads_idle--;
+		pthread_mutex_unlock(&pool->pool_lock);
+
+		atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_ACTIVE);
+		gettimeofday(&last_work_time, NULL);
+
+		ior_threads_pool_process_chain(pool, head);
+
+		atomic_store(&worker->state, IOR_THREADS_POOL_THREAD_STATE_IDLE);
+		pthread_mutex_lock(&pool->pool_lock);
+		pool->num_threads_idle++;
+		pthread_mutex_unlock(&pool->pool_lock);
 	}
 
 	return NULL;
@@ -377,152 +522,109 @@ static void *ior_threads_pool_worker_thread_func(void *arg)
 
 // ===== Operation Processing =====
 
-static int ior_threads_pool_process_sqe_chain(ior_threads_pool *pool, uint64_t start_position)
+/*
+ * Process one dispatched work chain. A chain is a run of IO_LINK ops claimed as
+ * a unit (head plus head->chain->...), so the whole chain is owned by this one
+ * worker - no other worker can run a mid-chain op out of order. Ops run in order
+ * until one fails, after which the remainder are cancelled (-ECANCELED), matching
+ * io_uring link semantics.
+ */
+static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head)
 {
-	ior_ctx_threads *ctx = pool->ctx;
-	int count = 0;
-	uint64_t current_position = start_position;
-	int continue_chain = 1;
+	uint64_t count = 0;
+	ior_work *w = head;
+	int cancel = 0; // a prior linked op failed/timed out; cancel the rest
 
-	while (continue_chain) {
-		continue_chain = 0;
+	while (w) {
+		ior_work *next = w->chain;
 
-		ior_sqe *sqe;
-		uint64_t next_position = 0; // Initialize to avoid garbage
-
-		// For first iteration, we already have the SQE from worker
-		if (current_position == start_position) {
-			// Need to peek at the already-picked SQE
-			uint32_t index = current_position & ctx->sq_ring.mask;
-			ior_sqe *sqes = (ior_sqe *) ctx->sq_ring.entries;
-			sqe = &sqes[index];
-			IOR_LOG_TRACE("processing first: index=%u", index);
-		} else {
-			// Pick next SQE in chain
-			sqe = ior_threads_ring_pick_sqe(&ctx->sq_ring, &next_position);
-			IOR_LOG_TRACE("picked next: position=%lu", next_position);
+		if (cancel) {
+			ior_cqe cqe;
+			memset(&cqe, 0, sizeof(cqe));
+			cqe.threads.user_data = w->sqe.threads.user_data;
+			cqe.threads.res = -ECANCELED;
+			ior_threads_pool_finish_op(pool, w, &cqe);
+			count++;
+			w = next;
+			continue;
 		}
 
-		if (!sqe) {
-			break;
+		// DRAIN: wait until every earlier-submitted op has completed.
+		if (w->sqe.threads.flags & IOR_SQE_IO_DRAIN) {
+			ior_threads_pool_drain_wait(pool, w->seq);
 		}
 
-		// Make a copy of the SQE
-		ior_sqe sqe_copy = *sqe;
-		int has_link = (sqe_copy.threads.flags & IOR_SQE_IO_LINK) != 0;
-		int has_drain = (sqe_copy.threads.flags & IOR_SQE_IO_DRAIN) != 0;
-
-		IOR_LOG_TRACE("processing flags: link=%d, drain=%d", has_link, has_drain);
-
-		// Handle DRAIN: wait until all prior SQEs complete
-		if (has_drain) {
-			IOR_LOG_TRACE("drain waiting: current_pos=%lu", current_position);
-			ior_threads_ring_wait_until_head(&ctx->sq_ring, current_position);
+		// Timers run on the dedicated timer thread, which finishes the op on
+		// expiry. A timeout completes with -ETIME, breaking any following link.
+		if (w->sqe.threads.opcode == IOR_OP_TIMER) {
+			int linked = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
+			ior_threads_pool_arm_timer(pool, w);
+			count++;
+			if (linked) {
+				cancel = 1;
+			}
+			w = next;
+			continue;
 		}
 
-		// Timers do not execute on a worker thread. Hand the timer off to the
-		// dedicated timer thread, which posts the completion and releases this
-		// SQ slot when the deadline fires (or drops it on shutdown). A timeout
-		// completes with -ETIME, which would break a LINK chain regardless, so
-		// we stop here; any following linked SQEs are picked up independently,
-		// matching the previous inline behavior.
-		if (sqe_copy.threads.opcode == IOR_OP_TIMER) {
-			ior_threads_pool_arm_timer(pool, &sqe_copy, current_position);
-			break;
-		}
+		int has_link = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
 
 		/*
-		 * Linked timeout: if this op is linked and the next submitted SQE is a link timeout, run
-		 * the guarded op bounded by the timeout's deadline (poll-gated) so it can be cancelled,
-		 * then complete both the guarded op and the link timeout (the tail of the chain).
+		 * Link timeout: a linked op immediately followed by a LINK_TIMEOUT runs
+		 * poll-gated against the timeout's deadline; both are completed here. The
+		 * pair is owned by this worker (claimed as one chain), so there is no race
+		 * over the link-timeout slot.
 		 */
-		if (has_link) {
-			uint32_t sq_tail = atomic_load_explicit(&ctx->sq_ring.tail, memory_order_acquire);
-			uint32_t lt_pos = (uint32_t) (current_position + 1);
-			if (lt_pos != sq_tail) {
-				ior_sqe *sqes = (ior_sqe *) ctx->sq_ring.entries;
-				ior_sqe *lt = &sqes[lt_pos & ctx->sq_ring.mask];
-				if (lt->threads.opcode == IOR_OP_LINK_TIMEOUT) {
-					ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->threads.addr;
-					uint64_t lt_user_data = lt->threads.user_data;
-					unsigned lt_flags = lt->threads.timeout_flags;
-
-					/*
-					 * Claim the link-timeout slot's exact position now, before running the
-					 * (poll-gated, possibly slow) guarded op, so this worker alone owns it and
-					 * posts/completes it exactly once. If another worker already claimed it, run
-					 * the guarded op unguarded and let that worker resolve the link timeout.
-					 */
-					if (ior_threads_ring_claim_position(&ctx->sq_ring, lt_pos)) {
-						int timeout_ms = -1;
-						if (ts) {
-							uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL
-									+ (uint64_t) ts->tv_nsec;
-							if (lt_flags & IOR_TIMEOUT_ABS) {
-								// Absolute deadline: convert to remaining time from now.
-								uint64_t now = ior_threads_pool_monotonic_ns();
-								ns = (ns > now) ? ns - now : 0;
-							}
-							uint64_t ms = (ns + 999999ULL) / 1000000ULL;
-							timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
-						}
-
-						ior_cqe gcqe;
-						ior_threads_pool_process_single_sqe_timed(
-								pool, &sqe_copy, &gcqe, timeout_ms);
-						int cancelled = (gcqe.threads.res == -ECANCELED);
-						ior_threads_pool_post_completion(pool, &gcqe);
-						ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
-						count++;
-
-						// -ETIME if the timeout cancelled the guarded op, else -ECANCELED (the
-						// guarded op finished first).
-						ior_cqe lcqe;
-						memset(&lcqe, 0, sizeof(lcqe));
-						lcqe.threads.user_data = lt_user_data;
-						lcqe.threads.res = cancelled ? -ETIME : -ECANCELED;
-						ior_threads_pool_post_completion(pool, &lcqe);
-						ior_threads_ring_complete_sqe(&ctx->sq_ring, lt_pos);
-						count++;
-						break;
-					}
-
-					// The link-timeout slot is owned by another worker; run the guarded op as a
-					// plain op and do not continue the chain (its only successor is that timeout).
-					has_link = 0;
+		if (has_link && next && next->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
+			// Capture the post-timeout successor before finishing (which frees the
+			// work items and may hand them to another thread).
+			ior_work *after = next->chain;
+			ior_timespec *ts = (ior_timespec *) (uintptr_t) next->sqe.threads.addr;
+			int timeout_ms = -1;
+			if (ts) {
+				uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+				if (next->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS) {
+					uint64_t now = ior_threads_pool_monotonic_ns();
+					ns = (ns > now) ? ns - now : 0;
 				}
+				uint64_t ms = (ns + 999999ULL) / 1000000ULL;
+				timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
 			}
+
+			ior_cqe gcqe;
+			ior_threads_pool_process_single_sqe_timed(pool, &w->sqe, &gcqe, timeout_ms);
+			int cancelled = (gcqe.threads.res == -ECANCELED);
+			ior_threads_pool_finish_op(pool, w, &gcqe);
+			count++;
+
+			// -ETIME if the timeout cancelled the guarded op, else -ECANCELED.
+			ior_cqe lcqe;
+			memset(&lcqe, 0, sizeof(lcqe));
+			lcqe.threads.user_data = next->sqe.threads.user_data;
+			lcqe.threads.res = cancelled ? -ETIME : -ECANCELED;
+			ior_threads_pool_finish_op(pool, next, &lcqe);
+			count++;
+
+			if (cancelled) {
+				cancel = 1; // guarded op was cancelled; break the rest of the chain
+			}
+			w = after;
+			continue;
 		}
 
-		// Process this SQE
+		// Normal op.
 		ior_cqe cqe;
-		ior_threads_pool_process_single_sqe(pool, &sqe_copy, &cqe);
-
-		// Post completion
-		ior_threads_pool_post_completion(pool, &cqe);
-
-		// Mark this SQE as completed
-		ior_threads_ring_complete_sqe(&ctx->sq_ring, current_position);
-
+		ior_threads_pool_process_single_sqe(pool, &w->sqe, &cqe);
+		ior_threads_pool_finish_op(pool, w, &cqe);
 		count++;
 
-		IOR_LOG_TRACE("completed: count=%d", count);
-
-		// If this SQE had IO_LINK flag and succeeded, continue to next
-		if (has_link && cqe.threads.res >= 0) {
-			// For first iteration, next_position needs to be calculated
-			if (current_position == start_position) {
-				next_position = start_position + 1;
-			}
-			continue_chain = 1;
-			current_position = next_position;
-			IOR_LOG_TRACE("link continue: next_position=%lu", next_position);
+		if (has_link && cqe.threads.res < 0) {
+			cancel = 1; // a failed linked op breaks the chain
 		}
+		w = next;
 	}
 
 	atomic_fetch_add(&pool->tasks_completed, count);
-
-	return count;
 }
 
 /*
@@ -838,16 +940,13 @@ static ior_threads_pool_timer ior_threads_pool_timer_pop(ior_threads_pool *pool)
 }
 
 /*
- * Arm a timeout. Validates the timespec and enqueues a pending timer for the
- * timer thread. Invalid timespecs (and a heap allocation failure) complete
- * inline so the caller never has to special-case them. The SQ slot is released
- * either here (inline error) or by the timer thread on expiry.
+ * Arm a timeout. Validates the timespec and enqueues the work item for the timer
+ * thread, which finishes it on expiry. Invalid timespecs (and a heap allocation
+ * failure) finish inline so the caller never has to special-case them.
  */
-static void ior_threads_pool_arm_timer(
-		ior_threads_pool *pool, const ior_sqe *sqe, uint64_t position)
+static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 {
-	ior_ctx_threads *ctx = pool->ctx;
-	ior_timespec *ts = (ior_timespec *) (uintptr_t) sqe->threads.addr;
+	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
 	int err = 0;
 
 	if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L) {
@@ -858,14 +957,13 @@ static void ior_threads_pool_arm_timer(
 		// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
 		// it is a relative duration from now.
 		uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-		uint64_t deadline_ns = (sqe->threads.timeout_flags & IOR_TIMEOUT_ABS)
+		uint64_t deadline_ns = (work->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
 				? ts_ns
 				: ior_threads_pool_monotonic_ns() + ts_ns;
 
 		ior_threads_pool_timer timer = {
 			.deadline_ns = deadline_ns,
-			.position = position,
-			.user_data = sqe->threads.user_data,
+			.work = work,
 		};
 
 		pthread_mutex_lock(&pool->timer_lock);
@@ -883,17 +981,15 @@ static void ior_threads_pool_arm_timer(
 	if (err) {
 		ior_cqe cqe;
 		memset(&cqe, 0, sizeof(cqe));
-		cqe.threads.user_data = sqe->threads.user_data;
+		cqe.threads.user_data = work->sqe.threads.user_data;
 		cqe.threads.res = -err;
-		ior_threads_pool_post_completion(pool, &cqe);
-		ior_threads_ring_complete_sqe(&ctx->sq_ring, position);
+		ior_threads_pool_finish_op(pool, work, &cqe);
 	}
 }
 
 static void *ior_threads_pool_timer_thread_func(void *arg)
 {
 	ior_threads_pool *pool = (ior_threads_pool *) arg;
-	ior_ctx_threads *ctx = pool->ctx;
 
 	IOR_LOG_TRACE("timer thread created");
 
@@ -938,12 +1034,10 @@ static void *ior_threads_pool_timer_thread_func(void *arg)
 
 		ior_cqe cqe;
 		memset(&cqe, 0, sizeof(cqe));
-		cqe.threads.user_data = fired.user_data;
+		cqe.threads.user_data = fired.work->sqe.threads.user_data;
 		cqe.threads.res = -ETIME;
 
-		IOR_LOG_TRACE("timer fired: pos=%lu, res=%d", fired.position, cqe.threads.res);
-		ior_threads_pool_post_completion(pool, &cqe);
-		ior_threads_ring_complete_sqe(&ctx->sq_ring, fired.position);
+		ior_threads_pool_finish_op(pool, fired.work, &cqe);
 
 		pthread_mutex_lock(&pool->timer_lock);
 	}

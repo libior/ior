@@ -12,18 +12,15 @@
 #define IOR_THREADS_RING_MAX_CQ_ENTRIES 65536 // 64K max CQ entries (2x SQ)
 
 /*
- * Ring buffer with out-of-order completion support:
+ * A single ring buffer used in two roles, selected by is_sq:
  *
- *   head        picked         tail         cached_tail
- *    |            |             |                |
- *    v            v             v                v
- *    [completed][picked/processing][submitted][reserved]
+ * - SQ ring (staging only): get_sqe reserves a slot (cached_tail), the caller
+ *   fills it, and submit copies it out and advances `consumed` to free the slot.
+ *   A slot is therefore free again right after submit, never held for the life of
+ *   the operation - matching io_uring, which consumes an SQE at submit time.
  *
- * Out-of-order completion:
- * - Workers complete SQEs in any order
- * - completed[] bitmap tracks which positions finished
- * - head advances when SQE at head position completes
- * - head_cond signals when head moves (for DRAIN)
+ * - CQ ring (MPSC completions): worker threads and the timer thread post CQEs
+ *   (serialized by tail_lock) and the single consumer reaps them via head.
  */
 typedef struct ior_threads_ring {
 	void *entries; // Continuous array of entries
@@ -32,17 +29,13 @@ typedef struct ior_threads_ring {
 	size_t entry_size; // sizeof(ior_sqe) or sizeof(ior_cqe)
 	uint8_t is_sq; // 1 for SQ, 0 for CQ
 
-	_Atomic uint32_t head; // Next to consume (moves when head completes)
-	_Atomic uint32_t tail; // Submitted/visible to workers
+	_Atomic uint32_t head; // CQ: next completion to reap
+	_Atomic uint32_t tail; // CQ: next slot to post into
 
-	// For SQ only:
-	_Atomic uint32_t cached_tail; // Reserved (get_sqe increments)
-	_Atomic uint32_t picked; // Picked by workers
-
-	// Out-of-order completion tracking (SQ only)
-	uint8_t *completed; // Bitmap: 1 if position completed
-	pthread_mutex_t head_lock; // Protects head advancement
-	pthread_cond_t head_cond; // Signals when head moves
+	// SQ only: staging cursors. get_sqe reserves at cached_tail; submit copies
+	// the staged SQEs out and advances consumed to free their slots.
+	_Atomic uint32_t cached_tail; // Reserved by get_sqe
+	_Atomic uint32_t consumed; // Freed once copied out at submit
 
 	// CQ only: serializes the multiple completion producers (worker threads and
 	// the timer thread) against the single consumer. Completions are MPSC.
@@ -58,33 +51,18 @@ void ior_threads_ring_destroy(ior_threads_ring *ring);
 // ===== Helper Functions =====
 
 uint32_t ior_threads_ring_count(ior_threads_ring *ring);
-uint32_t ior_threads_ring_pending_count(ior_threads_ring *ring);
 int ior_threads_ring_empty(ior_threads_ring *ring);
 int ior_threads_ring_full(ior_threads_ring *ring);
-uint32_t ior_threads_ring_space(ior_threads_ring *ring);
 
-// ===== Submission Queue Operations =====
+// ===== Submission Queue Operations (staging) =====
 
-// Get next SQE slot (increments cached_tail)
+// Reserve the next SQE slot (advances cached_tail); NULL if the staging ring is
+// full of not-yet-submitted entries.
 ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring);
 
-// Submit pending SQEs (moves tail to cached_tail)
-void ior_threads_ring_submit(ior_threads_ring *ring);
-
-// Pick next SQE for processing (increments picked, returns position)
-ior_sqe *ior_threads_ring_pick_sqe(ior_threads_ring *ring, uint64_t *sqe_position);
-
-// Claim one specific position iff it is still the next unpicked slot
-// (picked == position). Returns 1 on success (picked advanced past it), 0 if
-// another worker already claimed it. Lets the worker draining a link chain bind
-// the link-timeout slot to itself so no other worker can pick it concurrently.
-int ior_threads_ring_claim_position(ior_threads_ring *ring, uint64_t position);
-
-// Mark SQE at position as completed (advances head if possible, broadcasts head_cond)
-void ior_threads_ring_complete_sqe(ior_threads_ring *ring, uint64_t sqe_position);
-
-// Wait until head >= position (for DRAIN)
-int ior_threads_ring_wait_until_head(ior_threads_ring *ring, uint64_t position);
+// Free all reserved staging slots up to cached_tail (advance consumed). Called
+// once submit has copied the staged SQEs out of the ring.
+void ior_threads_ring_consume(ior_threads_ring *ring);
 
 // ===== Completion Queue Operations =====
 
@@ -93,9 +71,5 @@ ior_cqe *ior_threads_ring_peek_cqe(ior_threads_ring *ring);
 void ior_threads_ring_cqe_seen(ior_threads_ring *ring);
 uint32_t ior_threads_ring_peek_batch_cqe(ior_threads_ring *ring, ior_cqe **cqes, uint32_t max);
 void ior_threads_ring_advance(ior_threads_ring *ring, uint32_t count);
-
-// ===== Ring Management =====
-
-int ior_threads_ring_resize(ior_threads_ring *ring, uint32_t new_size);
 
 #endif /* IOR_THREADS_RING_H */

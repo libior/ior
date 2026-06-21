@@ -138,7 +138,18 @@ static ior_sqe *ior_threads_backend_get_sqe(void *backend_ctx)
 	}
 
 	ior_ctx_threads *ctx = backend_ctx;
-	return ior_threads_ring_get_sqe(&ctx->sq_ring);
+
+	// Cap in-flight at the work-item pool capacity (the CQ bound) so a submit
+	// always has a work item; the staging ring caps the unsubmitted batch.
+	if (atomic_load(&ctx->pool->outstanding) >= ctx->pool->work_cap) {
+		return NULL;
+	}
+	ior_sqe *sqe = ior_threads_ring_get_sqe(&ctx->sq_ring);
+	if (!sqe) {
+		return NULL;
+	}
+	atomic_fetch_add(&ctx->pool->outstanding, 1);
+	return sqe;
 }
 
 static int ior_threads_backend_submit(void *backend_ctx)
@@ -149,13 +160,15 @@ static int ior_threads_backend_submit(void *backend_ctx)
 
 	ior_ctx_threads *ctx = backend_ctx;
 
-	// Get number of pending submissions
-	uint32_t count = ior_threads_ring_pending_count(&ctx->sq_ring);
+	// Number of staged (reserved-but-not-yet-dispatched) SQEs.
+	uint32_t cached = atomic_load_explicit(&ctx->sq_ring.cached_tail, memory_order_acquire);
+	uint32_t consumed = atomic_load_explicit(&ctx->sq_ring.consumed, memory_order_acquire);
+	uint32_t count = cached - consumed;
 	if (count == 0) {
 		return 0;
 	}
 
-	// Notify thread pool of new work
+	// Copy staged SQEs into work items, dispatch them, and provision workers.
 	ior_threads_pool_notify(ctx->pool, count);
 
 	return (int) count;

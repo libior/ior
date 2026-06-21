@@ -40,10 +40,22 @@ typedef enum {
  * slot itself. The condition variable also lets shutdown interrupt the wait
  * immediately.
  */
+/*
+ * A submitted operation, copied out of the SQ ring at submit time. Workers
+ * consume these from the dispatch queue, so a slow op never pins an SQ slot.
+ * Items live in a fixed pool and move between the free list and the dispatch
+ * FIFO via `next`; `chain` links the ops of one IO_LINK chain.
+ */
+typedef struct ior_work {
+	ior_sqe sqe; // copied submission entry
+	uint64_t seq; // submission order, for IO_DRAIN
+	struct ior_work *next; // free-list / dispatch-FIFO link
+	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
+} ior_work;
+
 typedef struct ior_threads_pool_timer {
 	uint64_t deadline_ns; // Absolute CLOCK_MONOTONIC deadline
-	uint64_t position; // SQ ring position to release on expiry
-	uint64_t user_data; // CQE user_data to report
+	ior_work *work; // the timeout op; freed when it expires
 } ior_threads_pool_timer;
 
 // Per-thread data structure
@@ -84,6 +96,39 @@ struct ior_threads_pool {
 
 	// Statistics
 	_Atomic uint64_t tasks_completed;
+
+	/*
+	 * Free-at-submit dispatch. submit() copies each SQE into a work item and
+	 * enqueues it (chains as a unit) onto the dispatch FIFO, freeing the SQ slot
+	 * immediately; workers consume from the FIFO. The work pool is fixed at
+	 * cq_entries, the in-flight bound. All of this is protected by pool_lock.
+	 */
+	ior_work *work_items; // pool array [work_cap]
+	ior_work *work_free; // free list
+	ior_work *disp_head; // dispatch FIFO head (oldest)
+	ior_work *disp_tail; // dispatch FIFO tail
+	uint32_t work_cap;
+	uint64_t next_seq; // next submission sequence to assign
+
+	/*
+	 * outstanding = reserved-but-not-completed (get_sqe backpressure);
+	 * num_inflight = submitted-but-not-completed (worker provisioning target).
+	 * Both decrement at completion, in any order - no lock-free-pick skew.
+	 */
+	_Atomic uint32_t outstanding;
+	_Atomic uint32_t num_inflight;
+
+	/*
+	 * IO_DRAIN ordering, keyed on submission sequence. A drain op waits until
+	 * every earlier seq has completed. drain_done marks completed seqs and
+	 * drain_upto is the contiguous front; sized past the in-flight span so seqs
+	 * never alias.
+	 */
+	uint8_t *drain_done;
+	uint32_t drain_mask;
+	uint64_t drain_upto;
+	pthread_mutex_t drain_lock;
+	pthread_cond_t drain_cond;
 };
 
 // Thread pool configuration
