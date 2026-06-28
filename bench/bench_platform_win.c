@@ -172,12 +172,21 @@ ior_fd_t bench_open_tmpfile(const char *dir, uint64_t size)
 	}
 
 	/* Fill with real data (not a sparse hole) so reads do actual work. The
-	 * overlapped handle still supports synchronous WriteFile when lpOverlapped
-	 * is NULL for a file opened without an explicit position, so write
-	 * sequentially with an OVERLAPPED carrying the running offset. */
+	 * handle is opened FILE_FLAG_OVERLAPPED, so WriteFile is asynchronous and
+	 * typically returns FALSE/ERROR_IO_PENDING - we must wait for each write to
+	 * complete rather than assume a synchronous result. The file is not yet
+	 * associated with an IOCP here, so an event in the OVERLAPPED lets us block
+	 * on completion with GetOverlappedResult. */
 	if (size > 0) {
 		static char buf[65536];
 		memset(buf, 0xab, sizeof(buf));
+
+		HANDLE ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+		if (ev == NULL) {
+			CloseHandle(h);
+			return IOR_INVALID_FD;
+		}
+
 		uint64_t off = 0;
 		uint64_t remaining = size;
 		while (remaining > 0) {
@@ -186,14 +195,28 @@ ior_fd_t bench_open_tmpfile(const char *dir, uint64_t size)
 			memset(&ov, 0, sizeof(ov));
 			ov.Offset = (DWORD) (off & 0xffffffffULL);
 			ov.OffsetHigh = (DWORD) (off >> 32);
+			ov.hEvent = ev; /* WriteFile resets this before starting the I/O */
+
 			DWORD written = 0;
-			if (!WriteFile(h, buf, chunk, &written, &ov) || written != chunk) {
+			BOOL ok = WriteFile(h, buf, chunk, &written, &ov);
+			if (!ok) {
+				if (GetLastError() != ERROR_IO_PENDING
+						|| !GetOverlappedResult(h, &ov, &written, TRUE)) {
+					CloseHandle(ev);
+					CloseHandle(h);
+					return IOR_INVALID_FD;
+				}
+			}
+			if (written != chunk) {
+				CloseHandle(ev);
 				CloseHandle(h);
 				return IOR_INVALID_FD;
 			}
 			off += written;
 			remaining -= written;
 		}
+
+		CloseHandle(ev);
 	}
 
 	return (ior_fd_t) h;
