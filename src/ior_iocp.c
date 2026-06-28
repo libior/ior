@@ -1932,7 +1932,12 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 
 	unsigned count = 0;
 
-	while (count < max && !ready_queue_empty(&ctx->ready)) {
+	// Drain whatever is already buffered. Bound by ready.count, not just
+	// emptiness: this peeks without popping, so the entries stay in the queue
+	// (e.g. a completion left behind by a prior wait_cqe). Looping on
+	// !ready_queue_empty() would never terminate on the count and would read
+	// past the live entries into NULL ring slots.
+	while (count < max && count < ctx->ready.count) {
 		ior_iocp_op *op = ctx->ready.ops[(ctx->ready.head + count) & ctx->ready.mask];
 		cqes[count] = &op->cqe;
 		count++;
