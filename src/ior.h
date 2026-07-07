@@ -97,6 +97,8 @@ typedef struct ior_timespec {
 #define IOR_OP_RECV 10
 /** Timeout that cancels the preceding linked op (ior_prep_link_timeout). */
 #define IOR_OP_LINK_TIMEOUT 11
+/** Run a user callback on the backend's thread pool (ior_prep_work). */
+#define IOR_OP_WORK 12
 /** @} */
 
 /**
@@ -165,6 +167,11 @@ typedef enum {
 #define IOR_FEAT_POLL_ADD (1U << 3)
 /** Kernel submission polling is supported. */
 #define IOR_FEAT_SQPOLL (1U << 4)
+/** User work callbacks are supported (ior_prep_work). Set by every backend:
+ *  the io_uring backend requires liburing 2.2+ and kernel 5.18+
+ *  (IORING_OP_MSG_RING) and is only selected when they are available;
+ *  otherwise the threads backend is used. */
+#define IOR_FEAT_WORK (1U << 5)
 /** @} */
 
 /**
@@ -471,6 +478,75 @@ void ior_prep_send(
  */
 void ior_prep_recv(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
+
+/**
+ * @brief Opaque per-operation handle passed to a work callback.
+ *
+ * Lets a running callback observe cancellation (a fired link timeout or
+ * context teardown) via ior_work_cancelled(). Valid only for the duration of
+ * the callback invocation.
+ */
+typedef struct ior_work_token ior_work_token;
+
+/**
+ * @brief User work callback executed on the backend's thread pool.
+ *
+ * The returned value becomes the operation's CQE result (use a negative errno
+ * to report failure, e.g. -ECANCELED after observing cancellation).
+ *
+ * @param token  Cancellation handle; poll ior_work_cancelled(token) from
+ *               long-running callbacks to support link timeouts and fast
+ *               teardown. Valid only during this invocation.
+ * @param arg    The pointer given to ior_prep_work().
+ */
+typedef int32_t (*ior_work_fn)(ior_work_token *token, void *arg);
+
+/**
+ * Prepare a work operation: run @p fn on the backend's worker thread pool and
+ * post a CQE with its return value once it finishes.
+ *
+ * Execution starts at ior_submit(). Every successfully submitted work op
+ * invokes its callback exactly once - including during ior_queue_exit(), which
+ * waits for queued callbacks to run - unless a linked timeout fires before the
+ * callback has started, in which case the callback never runs and the op
+ * completes with -ECANCELED.
+ *
+ * Attach ior_sqe_set_data() as with any other op to correlate the completion;
+ * @p arg is independent of the CQE user data.
+ *
+ * A work op may be guarded by ior_prep_link_timeout() (submit the work op with
+ * IOR_SQE_IO_LINK, the link timeout as the next entry). Both entries always
+ * produce a CQE:
+ *   - callback finishes first: work CQE = callback's return value, link
+ *     timeout CQE = -ECANCELED;
+ *   - timeout fires before the callback started: work CQE = -ECANCELED (the
+ *     callback never runs), link timeout CQE = -ETIME;
+ *   - timeout fires while the callback runs: the callback cannot be killed;
+ *     the token is flagged so it can return early, the work CQE carries its
+ *     return value when it does, and the link timeout CQE = -ETIME.
+ * Other IOR_SQE_IO_LINK / IOR_SQE_IO_DRAIN combinations involving work ops are
+ * not supported on the io_uring backend (the kernel cannot order around a
+ * userspace callback).
+ *
+ * @param ctx  I/O context.
+ * @param sqe  Entry from ior_get_sqe().
+ * @param fn   Callback to run; its return value becomes the CQE result.
+ * @param arg  Opaque pointer passed to @p fn.
+ * @return 0 on success, -EINVAL for bad arguments, or -ENOMEM.
+ */
+int ior_prep_work(ior_ctx *ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);
+
+/**
+ * Check whether a running work callback has been cancelled.
+ *
+ * Returns non-zero once the guarding link timeout has fired or the context is
+ * being torn down. Callable only from within the work callback that received
+ * @p token.
+ *
+ * @param token  The token passed to the running callback.
+ * @return Non-zero if cancelled, 0 otherwise.
+ */
+int ior_work_cancelled(const ior_work_token *token);
 
 /**
  * Attach an opaque user-data pointer to an entry.

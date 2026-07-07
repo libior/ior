@@ -50,6 +50,8 @@ typedef struct handle_set {
 	CRITICAL_SECTION lock;
 } handle_set;
 
+struct ior_ctx_iocp;
+
 /* IOCP operation structure - wraps OVERLAPPED */
 typedef struct ior_iocp_op {
 	OVERLAPPED overlapped; // MUST be first for GetQueuedCompletionStatus casting
@@ -107,6 +109,15 @@ typedef struct ior_iocp_op {
 
 	// Flags for completion handling
 	bool is_synthetic; // True if synthetic completion
+
+	// IOR_OP_WORK: user callback executed on the private Win32 threadpool. The
+	// callback's return value (work_res) becomes the CQE result; the token lets
+	// it observe a fired link timeout or context teardown.
+	ior_work_fn work_fn;
+	void *work_arg;
+	int32_t work_res;
+	struct ior_ctx_iocp *work_owner;
+	struct ior_work_token token;
 
 	// Free list linkage (preserved across prep_*)
 	struct ior_iocp_op *next_free;
@@ -184,6 +195,18 @@ typedef struct ior_ctx_iocp {
 
 	atomic_uint_fast64_t submit_seq; // total submitted (sequence generator)
 	atomic_uint_fast64_t completed_cnt; // total completions dequeued from IOCP (not "seen")
+
+	/*
+	 * IOR_OP_WORK support: a private Win32 threadpool (created lazily on the
+	 * first work op) runs the callbacks; completions are delivered through
+	 * PostQueuedCompletionStatus like any synthetic completion. The cleanup
+	 * group lets destroy wait for every submitted callback - queued ones
+	 * included - honoring the "submitted callbacks always run" contract.
+	 */
+	_Atomic int shutdown; // lets running callbacks observe teardown via token
+	PTP_POOL work_pool;
+	PTP_CLEANUP_GROUP work_cleanup;
+	TP_CALLBACK_ENVIRON work_env;
 
 	uint32_t flags;
 	uint32_t features;
@@ -455,6 +478,13 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->bytes_transferred = 0;
 	op->error_code = 0;
 	op->is_synthetic = false;
+
+	op->work_fn = NULL;
+	op->work_arg = NULL;
+	op->work_res = 0;
+	op->work_owner = NULL;
+	atomic_init(&op->token.cancelled, 0);
+	op->token.shutdown = NULL;
 
 	return op;
 }
@@ -764,15 +794,81 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return post_synthetic_completion(ctx, op, (DWORD) err, 0);
 }
 
+/*
+ * ================= Work op support =================
+ *
+ * The callback runs on a private Win32 threadpool and delivers its completion
+ * with PostQueuedCompletionStatus, so it flows through the same dequeue path
+ * (and LINK/DRAIN/link-timeout machinery) as every other op.
+ */
+
+static VOID CALLBACK ior_iocp_work_callback(PTP_CALLBACK_INSTANCE instance, PVOID param)
+{
+	(void) instance;
+	ior_iocp_op *op = param;
+	ior_ctx_iocp *ctx = op->work_owner;
+
+	op->work_res = op->work_fn(&op->token, op->work_arg);
+
+	(void) post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+}
+
+// One-time (per context) creation of the private threadpool.
+static int iocp_work_ensure(ior_ctx_iocp *ctx)
+{
+	if (ctx->work_pool) {
+		return 0;
+	}
+
+	ctx->work_pool = CreateThreadpool(NULL);
+	if (!ctx->work_pool) {
+		return -ENOMEM;
+	}
+	SetThreadpoolThreadMaximum(ctx->work_pool, 32);
+
+	ctx->work_cleanup = CreateThreadpoolCleanupGroup();
+	if (!ctx->work_cleanup) {
+		CloseThreadpool(ctx->work_pool);
+		ctx->work_pool = NULL;
+		return -ENOMEM;
+	}
+
+	InitializeThreadpoolEnvironment(&ctx->work_env);
+	SetThreadpoolCallbackPool(&ctx->work_env, ctx->work_pool);
+	SetThreadpoolCallbackCleanupGroup(&ctx->work_env, ctx->work_cleanup, NULL);
+
+	return 0;
+}
+
+static int issue_work(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (iocp_work_ensure(ctx) < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
+	op->work_owner = ctx;
+	atomic_init(&op->token.cancelled, 0);
+	op->token.shutdown = &ctx->shutdown;
+
+	if (!TrySubmitThreadpoolCallback(ior_iocp_work_callback, op, &ctx->work_env)) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
+	return 0;
+}
+
 static void op_to_cqe(ior_iocp_op *op)
 {
 	op->cqe.iocp.user_data = op->user_data;
 	op->cqe.iocp.flags = 0;
 
-	if (op->error_code == ERROR_SUCCESS) {
-		op->cqe.iocp.res = (int32_t) op->bytes_transferred;
-	} else {
+	if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
+	} else if (op->opcode == IOR_OP_WORK) {
+		// The callback's return value, which may legitimately be negative.
+		op->cqe.iocp.res = op->work_res;
+	} else {
+		op->cqe.iocp.res = (int32_t) op->bytes_transferred;
 	}
 }
 
@@ -986,10 +1082,23 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			 * pair to us). Cancel the in-flight guarded op - its -ECANCELED
 			 * completion arrives through the normal IOCP path - and post this
 			 * link timeout as -ETIME.
+			 *
+			 * A guarded work op cannot be cancelled: its callback runs to
+			 * completion on the threadpool and posts its real result. Flag its
+			 * token instead so the callback can bail out early. The store
+			 * happens under timers.lock, which the completion path also takes
+			 * to resolve the pair before the op can be reaped and recycled, so
+			 * the guarded op is guaranteed alive here.
 			 */
 			ior_iocp_op *guarded = op->guarded;
+			bool is_work = guarded->opcode == IOR_OP_WORK;
+			if (is_work) {
+				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
+			}
 			LeaveCriticalSection(&tm->lock);
-			CancelIoEx((HANDLE) guarded->fd, &guarded->overlapped);
+			if (!is_work) {
+				CancelIoEx((HANDLE) guarded->fd, &guarded->overlapped);
+			}
 			post_armed_op(ctx, op, ERROR_TIMEOUT);
 			EnterCriticalSection(&tm->lock);
 			continue;
@@ -1221,6 +1330,13 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			ret = issue_recv(ctx, op);
 			break;
 
+		case IOR_OP_WORK:
+			// Falls through to the link-timeout arming below: a guarded work
+			// op's deadline is watched by the timer thread while the callback
+			// runs on the threadpool.
+			ret = issue_work(ctx, op);
+			break;
+
 		case IOR_OP_TIMER:
 			return arm_timer(ctx, op);
 
@@ -1361,7 +1477,9 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return -ENOMEM;
 	}
 
-	ctx->features = IOR_FEAT_NATIVE_ASYNC;
+	atomic_store(&ctx->shutdown, 0);
+
+	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK;
 	params->features = ctx->features;
 
 	*backend_ctx = ctx;
@@ -1375,6 +1493,22 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	}
 
 	ior_ctx_iocp *ctx = backend_ctx;
+
+	/*
+	 * Let running work callbacks observe teardown through their tokens, then
+	 * wait for every submitted callback to finish - queued ones still run
+	 * (FALSE = do not cancel pending callbacks), honoring the contract that a
+	 * submitted work op's callback always executes. Their completions land in
+	 * the IOCP and are reclaimed by the drain loop below.
+	 */
+	atomic_store(&ctx->shutdown, 1);
+	if (ctx->work_pool) {
+		CloseThreadpoolCleanupGroupMembers(ctx->work_cleanup, FALSE, NULL);
+		CloseThreadpoolCleanupGroup(ctx->work_cleanup);
+		DestroyThreadpoolEnvironment(&ctx->work_env);
+		CloseThreadpool(ctx->work_pool);
+		ctx->work_pool = NULL;
+	}
 
 	// Stop timer thread
 	atomic_store(&ctx->timers.stop, 1);
@@ -2069,6 +2203,18 @@ static void ior_iocp_backend_prep_recv(
 	op->sock_flags = (DWORD) flags;
 }
 
+static int ior_iocp_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
+{
+	(void) backend_ctx;
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_WORK;
+	op->fd = NULL;
+	op->work_fn = fn;
+	op->work_arg = arg;
+	return 0;
+}
+
 static void ior_iocp_backend_sqe_set_data(ior_sqe *sqe, void *data)
 {
 	ior_iocp_op *op = (ior_iocp_op *) sqe;
@@ -2135,6 +2281,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_link_timeout = ior_iocp_backend_prep_link_timeout,
 	.prep_send = ior_iocp_backend_prep_send,
 	.prep_recv = ior_iocp_backend_prep_recv,
+	.prep_work = ior_iocp_backend_prep_work,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,
 	.cqe_get_data = ior_iocp_backend_cqe_get_data,

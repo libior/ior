@@ -28,6 +28,7 @@ set(TESTS
     test_link_timeout
     test_slow_op
     test_sq_reuse
+    test_work
 )
 
 # Add test for splice only on Linux with splice support

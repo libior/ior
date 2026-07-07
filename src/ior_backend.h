@@ -4,6 +4,18 @@
 
 #include "ior.h"
 #include "ior_log.h"
+#include <stdatomic.h>
+
+/*
+ * Work-op cancellation token, shared by all backends. Embedded in the
+ * backend's per-op state; `cancelled` is set by whichever thread arbitrates a
+ * fired link timeout, `shutdown` points at the backend's teardown flag so a
+ * running callback can also bail out during ior_queue_exit().
+ */
+struct ior_work_token {
+	_Atomic int cancelled;
+	const _Atomic int *shutdown; /* may be NULL */
+};
 
 /* Backend-specific SQE structures */
 #ifdef IOR_HAVE_URING
@@ -134,6 +146,9 @@ typedef struct ior_backend_ops {
 	void (*prep_link_timeout)(ior_sqe *sqe, ior_timespec *ts, unsigned flags);
 	void (*prep_send)(ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
 	void (*prep_recv)(ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
+	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some
+	 * backends record per-op state beyond the SQE (e.g. io_uring's job list). */
+	int (*prep_work)(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);
 	void (*sqe_set_data)(ior_sqe *sqe, void *data);
 	void (*sqe_set_flags)(ior_sqe *sqe, uint8_t flags);
 

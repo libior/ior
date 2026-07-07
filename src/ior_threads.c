@@ -98,7 +98,7 @@ static int ior_threads_backend_init(void **backend_ctx, ior_params *params)
 	}
 
 	// Set supported features
-	ctx->features = 0; // No special features for basic thread backend
+	ctx->features = IOR_FEAT_WORK;
 #ifdef IOR_HAVE_SPLICE
 	ctx->features |= IOR_FEAT_SPLICE;
 #endif
@@ -439,6 +439,17 @@ static void ior_threads_backend_prep_recv(
 	sqe->threads.rw_flags = (uint32_t) flags;
 }
 
+static int ior_threads_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
+{
+	(void) backend_ctx;
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_WORK;
+	sqe->threads.fd = IOR_INVALID_FD;
+	sqe->threads.addr = (uint64_t) (uintptr_t) fn;
+	sqe->threads.off = (uint64_t) (uintptr_t) arg;
+	return 0;
+}
+
 static void ior_threads_backend_sqe_set_data(ior_sqe *sqe, void *data)
 {
 	sqe->threads.user_data = (uint64_t) (uintptr_t) data;
@@ -504,6 +515,7 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_link_timeout = ior_threads_backend_prep_link_timeout,
 	.prep_send = ior_threads_backend_prep_send,
 	.prep_recv = ior_threads_backend_prep_recv,
+	.prep_work = ior_threads_backend_prep_work,
 	.sqe_set_data = ior_threads_backend_sqe_set_data,
 	.sqe_set_flags = ior_threads_backend_sqe_set_flags,
 	.cqe_get_data = ior_threads_backend_cqe_get_data,

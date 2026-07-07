@@ -170,6 +170,7 @@ endif()
 
 # Verify atomics actually work
 include(CheckCSourceCompiles)
+include(CheckCSourceRuns)
 
 check_c_source_compiles("
     #include <stdatomic.h>
@@ -238,8 +239,58 @@ if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
             " LIBURING_WORKS)
 
             if(LIBURING_WORKS)
-                set(IOR_HAVE_URING TRUE)
                 message(STATUS "liburing is functional")
+
+                # Work ops (IOR_OP_WORK) are a mandatory API feature; on the
+                # io_uring backend their completions are delivered via
+                # IORING_OP_MSG_RING. That needs liburing 2.2+ (compile check)
+                # and kernel 5.18+ (run check against the build host's kernel).
+                # Without either, the io_uring backend is disabled entirely and
+                # the threads backend is built instead.
+                check_c_source_compiles("
+                    #include <liburing.h>
+                    int main(void) {
+                        struct io_uring_sqe sqe;
+                        io_uring_prep_msg_ring(&sqe, 0, 0, 0, 0);
+                        return IORING_FEAT_CQE_SKIP != 0 ? 0 : 1;
+                    }
+                " HAVE_URING_MSG_RING)
+
+                if(HAVE_URING_MSG_RING)
+                    if(CMAKE_CROSSCOMPILING)
+                        # Cannot run a probe; assume the target kernel is 5.18+.
+                        # Build with IOR_FORCE_THREADS=ON to target older kernels.
+                        set(HAVE_URING_MSG_RING_KERNEL TRUE)
+                        message(STATUS "cross-compiling: assuming kernel 5.18+ (msg_ring)")
+                    else()
+                        check_c_source_runs("
+                            #include <liburing.h>
+                            int main(void) {
+                                struct io_uring ring;
+                                struct io_uring_params p = { 0 };
+                                int ok = 0;
+                                if (io_uring_queue_init_params(4, &ring, &p) < 0)
+                                    return 1;
+                                if (p.features & IORING_FEAT_CQE_SKIP) {
+                                    struct io_uring_probe *pr = io_uring_get_probe_ring(&ring);
+                                    if (pr) {
+                                        ok = io_uring_opcode_supported(pr, IORING_OP_MSG_RING);
+                                        io_uring_free_probe(pr);
+                                    }
+                                }
+                                io_uring_queue_exit(&ring);
+                                return ok ? 0 : 1;
+                            }
+                        " HAVE_URING_MSG_RING_KERNEL)
+                    endif()
+                endif()
+
+                if(HAVE_URING_MSG_RING AND HAVE_URING_MSG_RING_KERNEL)
+                    set(IOR_HAVE_URING TRUE)
+                else()
+                    message(STATUS "io_uring lacks msg_ring support (needs liburing 2.2+ "
+                        "and kernel 5.18+) - using threads backend")
+                endif()
             else()
                 message(WARNING "liburing found but doesn't compile/link properly - disabling")
             endif()
