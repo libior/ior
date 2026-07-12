@@ -27,25 +27,27 @@ typedef int (*scenario_fn)(const bench_options *, bench_metrics *, const char **
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s <socket|file|mixed|all> [options]\n", prog);
+	printf("Usage: %s <socket|file|mixed|work|all> [options]\n", prog);
 	printf("       %s --smoke\n\n", prog);
 	printf("Scenarios:\n");
 	printf("  socket   real loopback TCP request/response (PHP-style guarded recv)\n");
 	printf("  file     file read/write at a target queue depth\n");
-	printf("  mixed    read/write/nop/timeout blend (multi-producer completion stress)\n");
-	printf("  all      run socket (none+linked), file and mixed in sequence\n\n");
+	printf("  mixed    read/write/nop/timeout/work blend (multi-producer completion stress)\n");
+	printf("  work     user work callbacks on the worker pool at a target queue depth\n");
+	printf("  all      run socket (none+linked), file, mixed and work (none+linked)\n\n");
 	printf("Run length (default: --duration 2.0):\n");
 	printf("  --duration SEC     run each scenario for SEC seconds\n");
 	printf("  --ops N            instead, stop after N completed units of work\n\n");
 	printf("Workload:\n");
 	printf("  --conns N          socket: concurrent connections (default 64)\n");
 	printf("  --files N          file/mixed: number of files (default 8/4)\n");
-	printf("  --depth N          file/mixed: operations in flight (default 32/64)\n");
+	printf("  --depth N          file/mixed/work: operations in flight (default 32/64/64)\n");
 	printf("  --msg-size B       socket: payload bytes per direction (default 256)\n");
 	printf("  --block-size B     file/mixed: bytes per read/write (default 4096)\n");
 	printf("  --file-size B      file/mixed: size of each temp file (default 16MiB)\n");
-	printf("  --timer none|linked  socket: guard recv with a linked timeout (default none)\n");
-	printf("  --timeout-ms M     socket: guard timeout in ms (default 5000)\n");
+	printf("  --work-us U        work: CPU spin per callback in microseconds (default 5)\n");
+	printf("  --timer none|linked  socket/work: guard ops with a linked timeout (default none)\n");
+	printf("  --timeout-ms M     socket/work: guard timeout in ms (default 5000)\n");
 	printf("  --workspace DIR    directory for temp files (default platform tmp/ior)\n");
 	printf("  --sq-entries N     submission queue size hint\n\n");
 	printf("Output:\n");
@@ -68,6 +70,7 @@ static void defaults(bench_options *o)
 	o->msg_size = 256;
 	o->block_size = 4096;
 	o->file_size = 16ULL * 1024 * 1024;
+	o->work_us = 5;
 	o->timer_mode = BENCH_TIMER_NONE;
 	o->timeout_ms = 5000;
 	o->workspace = NULL;
@@ -135,6 +138,17 @@ static int run_smoke(void)
 	o.duration_s = 0;
 	errors += run_one(bench_run_mixed, "mixed", NULL, &o, 0);
 
+	/* work, unguarded and guarded (short spin keeps the run bounded) */
+	defaults(&o);
+	o.depth = 64;
+	o.work_us = 2;
+	o.ops = 4000;
+	o.duration_s = 0;
+	o.timer_mode = BENCH_TIMER_NONE;
+	errors += run_one(bench_run_work, "work", "timer=none", &o, 0);
+	o.timer_mode = BENCH_TIMER_LINKED;
+	errors += run_one(bench_run_work, "work", "timer=linked", &o, 0);
+
 	printf("\nsmoke result: %s (errors=%llu)\n", errors ? "FAIL" : "PASS",
 			(unsigned long long) errors);
 	return errors ? 1 : 0;
@@ -183,6 +197,8 @@ int main(int argc, char **argv)
 			o.block_size = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--file-size") == 0) {
 			o.file_size = parse_u64(NEXT());
+		} else if (strcmp(a, "--work-us") == 0) {
+			o.work_us = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--timeout-ms") == 0) {
 			o.timeout_ms = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--sq-entries") == 0) {
@@ -238,6 +254,9 @@ int main(int argc, char **argv)
 		errors = run_one(bench_run_file, "file", NULL, &o, csv);
 	} else if (strcmp(scenario, "mixed") == 0) {
 		errors = run_one(bench_run_mixed, "mixed", NULL, &o, csv);
+	} else if (strcmp(scenario, "work") == 0) {
+		const char *label = o.timer_mode == BENCH_TIMER_LINKED ? "timer=linked" : "timer=none";
+		errors = run_one(bench_run_work, "work", label, &o, csv);
 	} else if (strcmp(scenario, "all") == 0) {
 		bench_options so = o;
 		so.timer_mode = BENCH_TIMER_NONE;
@@ -246,6 +265,11 @@ int main(int argc, char **argv)
 		errors += run_one(bench_run_socket, "socket", "timer=linked", &so, csv);
 		errors += run_one(bench_run_file, "file", NULL, &o, csv);
 		errors += run_one(bench_run_mixed, "mixed", NULL, &o, csv);
+		so = o;
+		so.timer_mode = BENCH_TIMER_NONE;
+		errors += run_one(bench_run_work, "work", "timer=none", &so, csv);
+		so.timer_mode = BENCH_TIMER_LINKED;
+		errors += run_one(bench_run_work, "work", "timer=linked", &so, csv);
 	} else {
 		fprintf(stderr, "unknown scenario: %s\n", scenario);
 		usage(argv[0]);

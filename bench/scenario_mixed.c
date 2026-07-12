@@ -3,9 +3,10 @@
  * scenario_mixed.c - mixed operation blend at a target queue depth.
  *
  * Keeps `depth` operations in flight, cycling each completion slot through
- * read, write, nop and timeout. This deliberately drives all three completion
- * sources at once - worker threads (read/write), the immediate path (nop) and
- * the timer thread (timeout) - so completions are posted into the queue
+ * read, write, nop, timeout and a user work callback. This deliberately
+ * drives all the completion sources at once - worker threads (read/write),
+ * the immediate path (nop), the timer thread (timeout) and the pool's
+ * user-callback path (work) - so completions are posted into the queue
  * concurrently from several producers. It is the heaviest stress on the
  * multi-producer completion path and a scaled-up sibling of test_concurrency,
  * but as a throughput/latency benchmark rather than a pass/fail test.
@@ -27,8 +28,9 @@ enum {
 	MIX_WRITE = 1,
 	MIX_NOP = 2,
 	MIX_TIMEOUT = 3,
-	MIX_KINDS = 4,
-	MIX_KIND_BITS = 2,
+	MIX_WORK = 4,
+	MIX_KINDS = 5,
+	MIX_KIND_BITS = 3,
 	MIX_KIND_MASK = (1u << MIX_KIND_BITS) - 1,
 };
 
@@ -60,6 +62,15 @@ typedef struct mix_ctx {
  * adding wall-clock delay. File-scope so the pointer handed to ior_prep_timeout
  * stays valid until the op is submitted/processed (both backends keep it). */
 static ior_timespec bench_zero_timeout = { 0, 0 };
+
+/* Minimal user work callback: no CPU burn (the work scenario covers that), just
+ * one more completion producer racing the others. Echoes its argument back so
+ * harvest_one can verify per-op arg/result routing under contention. */
+static int32_t mix_work_fn(ior_work_token *token, void *arg)
+{
+	(void) token;
+	return (int32_t) (uintptr_t) arg;
+}
 
 /* Try to issue one op from a free slot; returns 0 if the SQ is momentarily
  * full so the caller harvests completions and retries (io_uring NULL-SQE
@@ -101,6 +112,9 @@ static int issue_one(mix_ctx *x)
 		case MIX_TIMEOUT:
 			ior_prep_timeout(x->ior, sqe, &bench_zero_timeout, 0, 0);
 			break;
+		case MIX_WORK:
+			ior_prep_work(x->ior, sqe, mix_work_fn, (void *) (uintptr_t) (si + 1));
+			break;
 	}
 	ior_sqe_set_data(x->ior, sqe, tag);
 	x->inflight++;
@@ -131,6 +145,9 @@ static void harvest_one(mix_ctx *x, ior_cqe *cqe)
 			break;
 		case MIX_TIMEOUT:
 			ok = (res == -ETIME || res == -ETIMEDOUT);
+			break;
+		case MIX_WORK:
+			ok = (res == (int32_t) (si + 1)); /* callback echoed its own arg */
 			break;
 		default:
 			ok = 0;

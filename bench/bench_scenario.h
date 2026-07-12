@@ -31,12 +31,13 @@ typedef struct bench_options {
 
 	uint32_t conns; /* socket scenario: concurrent connections */
 	uint32_t files; /* file scenario: concurrent files */
-	uint32_t depth; /* file/mixed: operations in flight */
+	uint32_t depth; /* file/mixed/work: operations in flight */
 	uint32_t msg_size; /* socket/mixed payload size in bytes */
 	uint64_t file_size; /* file scenario: size of each temp file */
 	uint32_t block_size; /* file scenario: bytes per read/write op */
+	uint32_t work_us; /* work scenario: CPU spin per callback, microseconds */
 
-	bench_timer_mode timer_mode; /* socket scenario timer guard */
+	bench_timer_mode timer_mode; /* socket/work scenario timer guard */
 	uint32_t timeout_ms; /* guard timeout (generous; firing is an error) */
 
 	const char *workspace; /* directory for temp files */
@@ -53,6 +54,7 @@ typedef struct bench_options {
 int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_file(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_mixed(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
+int bench_run_work(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 
 #ifdef __cplusplus
 }

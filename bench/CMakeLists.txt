@@ -8,6 +8,7 @@ set(BENCH_SOURCES
     scenario_socket.c
     scenario_file.c
     scenario_mixed.c
+    scenario_work.c
 )
 
 if(WIN32)
