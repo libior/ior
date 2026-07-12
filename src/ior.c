@@ -211,6 +211,33 @@ void ior_prep_recv(
 	}
 }
 
+int ior_prep_work(ior_ctx *ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
+{
+	if (!ctx || !sqe || !fn) {
+		return -EINVAL;
+	}
+	if (!ctx->ops->prep_work) {
+		return -EOPNOTSUPP;
+	}
+	return ctx->ops->prep_work(ctx->backend_ctx, sqe, fn, arg);
+}
+
+int ior_work_cancelled(const ior_work_token *token)
+{
+	if (!token) {
+		return 0;
+	}
+	// Cast away const: C11's atomic_load is not const-correct (fixed in C17).
+	ior_work_token *t = (ior_work_token *) token;
+	if (atomic_load_explicit(&t->cancelled, memory_order_acquire)) {
+		return 1;
+	}
+	if (t->shutdown && atomic_load_explicit((_Atomic int *) t->shutdown, memory_order_acquire)) {
+		return 1;
+	}
+	return 0;
+}
+
 void ior_sqe_set_data(ior_ctx *ctx, ior_sqe *sqe, void *data)
 {
 	if (ctx && sqe) {

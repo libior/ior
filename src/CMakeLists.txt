@@ -7,6 +7,13 @@ set(IOR_SOURCES
 # Backend selection based on platform and availability
 set(IOR_BACKEND_SOURCES)
 
+# Shared POSIX worker pool (used by both the threads and io_uring backends)
+if(IOR_HAVE_URING OR IOR_HAVE_THREADS)
+    list(APPEND IOR_BACKEND_SOURCES
+        ior_worker_pool.c
+    )
+endif()
+
 # Linux io_uring backend
 if(IOR_HAVE_URING)
     list(APPEND IOR_BACKEND_SOURCES
@@ -75,8 +82,9 @@ if(IOR_HAVE_URING)
     target_link_libraries(ior PRIVATE ${LIBURING_LIBRARIES})
 endif()
 
-# Platform-specific libraries
-if(IOR_HAVE_THREADS)
+# Platform-specific libraries (the shared worker pool needs pthreads even in
+# io_uring-only builds)
+if(IOR_HAVE_THREADS OR IOR_HAVE_URING)
     target_link_libraries(ior PRIVATE pthread)
 endif()
 

@@ -5,8 +5,10 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include "ior_backend.h"
 #include "ior_threads_event.h"
 #include "ior_threads_ring.h"
+#include "ior_worker_pool.h"
 
 // Forward declaration
 typedef struct ior_threads_pool ior_threads_pool;
@@ -23,97 +25,52 @@ typedef struct ior_ctx_threads {
 	uint32_t features;
 } ior_ctx_threads;
 
-// Thread state enumeration
-typedef enum {
-	IOR_THREADS_POOL_THREAD_STATE_IDLE = 0,
-	IOR_THREADS_POOL_THREAD_STATE_ACTIVE = 1,
-	IOR_THREADS_POOL_THREAD_STATE_STOPPING = 2,
-} ior_threads_pool_thread_state_t;
-
-/*
- * A pending timer managed by the dedicated timer thread.
- *
- * Timeout SQEs are not run on worker threads (a long sleep would tie up a
- * worker and, worse, block shutdown until it elapsed). Instead the worker
- * hands the timer to the timer thread, which sleeps on a condition variable
- * until the earliest deadline, then posts the completion and releases the SQ
- * slot itself. The condition variable also lets shutdown interrupt the wait
- * immediately.
- */
 /*
  * A submitted operation, copied out of the SQ ring at submit time. Workers
- * consume these from the dispatch queue, so a slow op never pins an SQ slot.
- * Items live in a fixed pool and move between the free list and the dispatch
- * FIFO via `next`; `chain` links the ops of one IO_LINK chain.
+ * consume these from the shared worker pool's dispatch queue, so a slow op
+ * never pins an SQ slot. Items live in a fixed pool and move between the free
+ * list (via `next`) and the pool FIFO (via the embedded job node); `chain`
+ * links the ops of one IO_LINK chain.
  */
 typedef struct ior_work {
+	ior_worker_pool_job job; // FIFO node while queued as a chain head
 	ior_sqe sqe; // copied submission entry
 	uint64_t seq; // submission order, for IO_DRAIN
-	struct ior_work *next; // free-list / dispatch-FIFO link
+	struct ior_work *next; // free-list link
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
+	struct ior_work_token token; // IOR_OP_WORK only: cancellation handle
 } ior_work;
 
-typedef struct ior_threads_pool_timer {
-	uint64_t deadline_ns; // Absolute CLOCK_MONOTONIC deadline
-	ior_work *work; // the timeout op; freed when it expires
-} ior_threads_pool_timer;
-
-// Per-thread data structure
-typedef struct ior_threads_pool_worker_thread {
-	pthread_t thread_id;
-	_Atomic ior_threads_pool_thread_state_t state;
-	struct ior_threads_pool *pool;
-	uint64_t tasks_completed;
-	struct ior_threads_pool_worker_thread *next;
-} ior_threads_pool_worker_thread_t;
-
-// Thread pool structure
+/*
+ * Thread pool structure. Worker/timer thread lifecycle and the dispatch FIFO
+ * live in the shared ior_worker_pool; this struct keeps only what is specific
+ * to the threads backend: the work-item pool, the in-flight accounting that
+ * backs get_sqe backpressure, and IO_DRAIN ordering.
+ */
 struct ior_threads_pool {
 	ior_ctx_threads *ctx;
 
-	// Thread management
-	pthread_mutex_t pool_lock;
-	ior_threads_pool_worker_thread_t *threads;
-	uint32_t num_threads_current;
-	uint32_t num_threads_idle;
-	uint32_t num_threads_min;
-	uint32_t num_threads_max;
-
-	// Work notification
-	pthread_cond_t work_cond;
-
-	// Shutdown flag
-	_Atomic int shutdown;
-
-	// Timer management (single thread, min-heap of pending timers by deadline)
-	pthread_t timer_thread;
-	int timer_thread_started;
-	pthread_mutex_t timer_lock;
-	pthread_cond_t timer_cond;
-	ior_threads_pool_timer *timer_heap;
-	uint32_t timer_heap_len;
-	uint32_t timer_heap_cap;
+	ior_worker_pool *wp; // shared worker lifecycle + job FIFO + timers
 
 	// Statistics
 	_Atomic uint64_t tasks_completed;
 
 	/*
 	 * Free-at-submit dispatch. submit() copies each SQE into a work item and
-	 * enqueues it (chains as a unit) onto the dispatch FIFO, freeing the SQ slot
-	 * immediately; workers consume from the FIFO. The work pool is fixed at
-	 * cq_entries, the in-flight bound. All of this is protected by pool_lock.
+	 * enqueues it (chains as a unit) onto the worker pool FIFO, freeing the SQ
+	 * slot immediately; workers consume from the FIFO. The work pool is fixed at
+	 * cq_entries, the in-flight bound. Protected by work_lock.
 	 */
+	pthread_mutex_t work_lock;
 	ior_work *work_items; // pool array [work_cap]
 	ior_work *work_free; // free list
-	ior_work *disp_head; // dispatch FIFO head (oldest)
-	ior_work *disp_tail; // dispatch FIFO tail
 	uint32_t work_cap;
 	uint64_t next_seq; // next submission sequence to assign
 
 	/*
 	 * outstanding = reserved-but-not-completed (get_sqe backpressure);
-	 * num_inflight = submitted-but-not-completed (worker provisioning target).
-	 * Both decrement at completion, in any order - no lock-free-pick skew.
+	 * num_inflight = submitted-but-not-completed. Both decrement at completion,
+	 * in any order - no lock-free-pick skew.
 	 */
 	_Atomic uint32_t outstanding;
 	_Atomic uint32_t num_inflight;
