@@ -604,8 +604,8 @@ static int post_synthetic_completion(
 }
 
 /*
- * Post a completion for an op whose active_count was already reserved at arm
- * time (armed timers and link timeouts). Unlike post_synthetic_completion it
+ * Post a completion for an op whose active_count was already reserved (armed
+ * timers, link timeouts, work ops). Unlike post_synthetic_completion it
  * does not increment active_count; on PQCS failure it undoes the reservation and
  * frees the op. Must be called without timers.lock held.
  */
@@ -810,7 +810,10 @@ static VOID CALLBACK ior_iocp_work_callback(PTP_CALLBACK_INSTANCE instance, PVOI
 
 	op->work_res = op->work_fn(&op->token, op->work_arg);
 
-	(void) post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+	/* The active_count slot was reserved in issue_work: posting from this
+	 * threadpool thread with a post-PQCS increment would race the consumer's
+	 * decrement at dequeue and underflow the counter. */
+	post_armed_op(ctx, op, ERROR_SUCCESS);
 }
 
 // One-time (per context) creation of the private threadpool.
@@ -850,7 +853,12 @@ static int issue_work(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	atomic_init(&op->token.cancelled, 0);
 	op->token.shutdown = &ctx->shutdown;
 
+	// Reserve the active_count slot up front, like arm_timer: the callback
+	// completes from another thread, so it must post with the slot already held.
+	atomic_fetch_add(&ctx->active_count, 1);
+
 	if (!TrySubmitThreadpoolCallback(ior_iocp_work_callback, op, &ctx->work_env)) {
+		atomic_fetch_sub(&ctx->active_count, 1);
 		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
 	}
 
