@@ -141,6 +141,7 @@ Set with `-D<OPTION>=<VALUE>`.
 | `IOR_WITH_URING` | ON | Look for liburing (Linux only) |
 | `IOR_FORCE_THREADS` | OFF | Use the thread backend even if io_uring works |
 | `IOR_FORCE_PIPE` | OFF | Force pipe instead of eventfd (testing) |
+| `IOR_FORCE_POLL` | OFF | Force poll() readiness poller instead of epoll/kqueue (testing) |
 | `IOR_ENABLE_LOG` | OFF | Enable the logging system |
 | `IOR_LOG_LEVEL` | 2 | 0=TRACE 1=DEBUG 2=INFO 3=WARN 4=ERROR |
 | `IOR_ENABLE_ASAN` | OFF | AddressSanitizer (GCC/Clang/MSVC) |
@@ -150,6 +151,10 @@ Set with `-D<OPTION>=<VALUE>`.
 `IOR_WITH_URING=OFF` never looks for liburing; `IOR_FORCE_THREADS=ON` ignores a
 working io_uring. Both yield the thread backend on Linux and have no effect on
 Windows/macOS.
+
+The thread backend's IOR_OP_POLL readiness poller uses epoll on Linux, kqueue
+on FreeBSD/OpenBSD/macOS, and poll() elsewhere; `IOR_FORCE_POLL=ON` selects
+the portable poll() variant anywhere (testing).
 
 Build types (GCC/Clang): Debug `-g -O0`, Release `-O3 -DNDEBUG`, RelWithDebInfo
 `-O2 -g`, MinSizeRel `-Os -DNDEBUG`. Default is RelWithDebInfo on single-config

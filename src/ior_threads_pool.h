@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include "ior_backend.h"
 #include "ior_threads_event.h"
+#include "ior_threads_poller.h"
 #include "ior_threads_ring.h"
 #include "ior_worker_pool.h"
 
@@ -51,6 +52,13 @@ struct ior_threads_pool {
 	ior_ctx_threads *ctx;
 
 	ior_worker_pool *wp; // shared worker lifecycle + job FIFO + timers
+
+	/*
+	 * Readiness multiplexer for IOR_OP_POLL. Created lazily on the first poll
+	 * op (guarded by work_lock); destroyed after the worker pool so drained
+	 * chains can still hand off to it.
+	 */
+	_Atomic(ior_threads_poller *) poller;
 
 	// Statistics
 	_Atomic uint64_t tasks_completed;

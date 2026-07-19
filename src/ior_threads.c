@@ -98,7 +98,7 @@ static int ior_threads_backend_init(void **backend_ctx, ior_params *params)
 	}
 
 	// Set supported features
-	ctx->features = IOR_FEAT_WORK;
+	ctx->features = IOR_FEAT_WORK | IOR_FEAT_POLL_ADD;
 #ifdef IOR_HAVE_SPLICE
 	ctx->features |= IOR_FEAT_SPLICE;
 #endif
@@ -439,6 +439,14 @@ static void ior_threads_backend_prep_recv(
 	sqe->threads.rw_flags = (uint32_t) flags;
 }
 
+static void ior_threads_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_POLL;
+	sqe->threads.fd = fd;
+	sqe->threads.poll_events = poll_mask;
+}
+
 static int ior_threads_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	(void) backend_ctx;
@@ -515,6 +523,7 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_link_timeout = ior_threads_backend_prep_link_timeout,
 	.prep_send = ior_threads_backend_prep_send,
 	.prep_recv = ior_threads_backend_prep_recv,
+	.prep_poll_add = ior_threads_backend_prep_poll_add,
 	.prep_work = ior_threads_backend_prep_work,
 	.sqe_set_data = ior_threads_backend_sqe_set_data,
 	.sqe_set_flags = ior_threads_backend_sqe_set_flags,

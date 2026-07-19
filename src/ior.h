@@ -99,6 +99,9 @@ typedef struct ior_timespec {
 #define IOR_OP_LINK_TIMEOUT 11
 /** Run a user callback on the backend's thread pool (ior_prep_work). */
 #define IOR_OP_WORK 12
+/** Wait for fd readiness (ior_prep_poll_add); completes with an IOR_POLL_*
+ *  mask in res. */
+#define IOR_OP_POLL 13
 /** @} */
 
 /**
@@ -140,6 +143,26 @@ typedef struct ior_timespec {
 #define IOR_TIMEOUT_ABS (1U << 0)
 /** @} */
 
+/**
+ * @name Poll event masks
+ * Bits for the mask argument of ior_prep_poll_add() and for the resulting CQE
+ * res. Values match Linux poll(2) event bits. IOR_POLL_ERR, IOR_POLL_HUP and
+ * IOR_POLL_NVAL are output-only: always reported in res when they apply,
+ * regardless of the requested mask (standard poll semantics).
+ * @{
+ */
+/** Data available to read. */
+#define IOR_POLL_IN 0x001
+/** Ready for writing. */
+#define IOR_POLL_OUT 0x004
+/** Error condition (output only). */
+#define IOR_POLL_ERR 0x008
+/** Peer hung up (output only). */
+#define IOR_POLL_HUP 0x010
+/** Invalid descriptor (output only). */
+#define IOR_POLL_NVAL 0x020
+/** @} */
+
 /** Asynchronous I/O backend implementation. */
 typedef enum {
 	/** Auto-select the best backend for the platform. */
@@ -163,7 +186,7 @@ typedef enum {
 #define IOR_FEAT_SPLICE (1U << 1)
 /** Registered/fixed files are supported. */
 #define IOR_FEAT_FIXED_FILE (1U << 2)
-/** Poll-based readiness is supported. */
+/** IOR_OP_POLL readiness ops are supported (ior_prep_poll_add). */
 #define IOR_FEAT_POLL_ADD (1U << 3)
 /** Kernel submission polling is supported. */
 #define IOR_FEAT_SQPOLL (1U << 4)
@@ -478,6 +501,26 @@ void ior_prep_send(
  */
 void ior_prep_recv(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
+
+/**
+ * Prepare a one-shot wait for fd readiness (like io_uring's POLL_ADD).
+ *
+ * Completes when the descriptor becomes ready for any requested event: the CQE
+ * res is the mask of ready IOR_POLL_* events (> 0), or a negative errno. The
+ * operation is one-shot; re-arm by submitting a new poll. Requires
+ * IOR_FEAT_POLL_ADD. For a bounded wait, guard it with ior_prep_link_timeout()
+ * (poll completes with -ECANCELED, the timeout with -ETIME).
+ *
+ * On the threads and IOCP backends all pending polls are multiplexed on a
+ * single poller thread. On the IOCP backend only sockets are pollable; other
+ * handles complete with -ENOTSOCK.
+ *
+ * @param ctx        I/O context.
+ * @param sqe        Entry from ior_get_sqe().
+ * @param fd         Descriptor to watch.
+ * @param poll_mask  Events to wait for (IOR_POLL_IN, IOR_POLL_OUT, ...).
+ */
+void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 
 /**
  * @brief Opaque per-operation handle passed to a work callback.

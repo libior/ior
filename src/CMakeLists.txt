@@ -40,6 +40,21 @@ if(IOR_HAVE_THREADS)
             ior_threads_event_pipe.c
         )
     endif()
+
+    # Readiness poller implementation
+    if(IOR_HAVE_EPOLL)
+        list(APPEND IOR_BACKEND_SOURCES
+            ior_threads_poller_epoll.c
+        )
+    elseif(IOR_HAVE_KQUEUE)
+        list(APPEND IOR_BACKEND_SOURCES
+            ior_threads_poller_kqueue.c
+        )
+    else()
+        list(APPEND IOR_BACKEND_SOURCES
+            ior_threads_poller_poll.c
+        )
+    endif()
 endif()
 
 # Windows IOCP backend
