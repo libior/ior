@@ -76,6 +76,10 @@ typedef struct ior_iocp_op {
 	WSABUF wsabuf;
 	DWORD sock_flags;
 
+	// IOR_OP_POLL: requested IOR_POLL_* mask; the ready mask is delivered in
+	// work_res (posted like a work-op result).
+	uint32_t poll_mask;
+
 	// Timeout-specific fields
 	ior_timespec *timeout_ts;
 	uint32_t timeout_flags;
@@ -146,6 +150,28 @@ typedef struct timer_mgr {
 	uint32_t heap_cap;
 } timer_mgr;
 
+/*
+ * IOR_OP_POLL multiplexer - one dedicated thread blocking in WSAPoll over
+ * every pending poll op (sockets only). Registration and teardown wake it
+ * through a loopback UDP socket pair (WSAPoll can only wait on sockets); a
+ * fired link timeout flags the op's token from the timer thread and wakes it
+ * the same way. The thread and the wakeup sockets are created lazily on the
+ * first poll op; incoming ops are linked through next_pending.
+ */
+typedef struct iocp_poller {
+	CRITICAL_SECTION lock;
+	HANDLE thread; // NULL until the first poll op
+	SOCKET wake_tx;
+	SOCKET wake_rx;
+	_Atomic uint32_t stop;
+	ior_iocp_op *incoming; // protected by lock
+	// Active ops and their WSAPOLLFD slots ([0] is wake_rx); poller thread only.
+	ior_iocp_op **active;
+	WSAPOLLFD *pfds;
+	uint32_t active_len;
+	uint32_t active_cap;
+} iocp_poller;
+
 /* QPC frequency, initialized once during backend init.
  *
  * Stored as an atomic so that the publishing thread's write is observed with
@@ -184,6 +210,9 @@ typedef struct ior_ctx_iocp {
 
 	// Timer manager
 	timer_mgr timers;
+
+	// IOR_OP_POLL readiness multiplexer
+	iocp_poller poller;
 
 	// Handle association tracking
 	handle_set handles;
@@ -865,6 +894,279 @@ static int issue_work(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return 0;
 }
 
+/* ================= IOR_OP_POLL support ================= */
+
+static SHORT ior_poll_mask_to_wsa(uint32_t ior_mask)
+{
+	SHORT ev = 0;
+	if (ior_mask & IOR_POLL_IN) {
+		ev |= POLLRDNORM | POLLRDBAND;
+	}
+	if (ior_mask & IOR_POLL_OUT) {
+		ev |= POLLWRNORM;
+	}
+	// ERR/HUP/NVAL are revents-only on Windows and must not be requested.
+	return ev;
+}
+
+static uint32_t wsa_to_ior_poll_mask(SHORT revents)
+{
+	uint32_t mask = 0;
+	if (revents & (POLLRDNORM | POLLRDBAND)) {
+		mask |= IOR_POLL_IN;
+	}
+	if (revents & POLLWRNORM) {
+		mask |= IOR_POLL_OUT;
+	}
+	if (revents & POLLERR) {
+		mask |= IOR_POLL_ERR;
+	}
+	if (revents & POLLHUP) {
+		mask |= IOR_POLL_HUP;
+	}
+	if (revents & POLLNVAL) {
+		mask |= IOR_POLL_NVAL;
+	}
+	return mask;
+}
+
+static void iocp_poller_wake(iocp_poller *p)
+{
+	char b = 0;
+	(void) send(p->wake_tx, &b, 1, 0);
+}
+
+static void iocp_poller_drain_wake(iocp_poller *p)
+{
+	char buf[64];
+	while (recv(p->wake_rx, buf, sizeof(buf), 0) > 0) {
+	}
+}
+
+/* Remove slot i by swapping in the last active entry. */
+static void iocp_poller_remove(iocp_poller *p, uint32_t i)
+{
+	p->active_len--;
+	p->active[i] = p->active[p->active_len];
+	p->pfds[i + 1] = p->pfds[p->active_len + 1];
+}
+
+/* Complete a poll op from the poller thread (active_count slot already held). */
+static void iocp_poller_post(ior_ctx_iocp *ctx, ior_iocp_op *op, SHORT revents)
+{
+	if (revents & POLLNVAL) {
+		// Not a socket (or a closed one) - poll works on sockets only.
+		post_armed_op(ctx, op, WSAENOTSOCK);
+		return;
+	}
+	op->work_res = (int32_t) wsa_to_ior_poll_mask(revents);
+	post_armed_op(ctx, op, ERROR_SUCCESS);
+}
+
+static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
+{
+	ior_ctx_iocp *ctx = arg;
+	iocp_poller *p = &ctx->poller;
+
+	for (;;) {
+		// Ingest newly registered ops.
+		EnterCriticalSection(&p->lock);
+		ior_iocp_op *in = p->incoming;
+		p->incoming = NULL;
+		LeaveCriticalSection(&p->lock);
+
+		while (in) {
+			ior_iocp_op *next = in->next_pending;
+			in->next_pending = NULL;
+			if (p->active_len == p->active_cap) {
+				uint32_t cap = p->active_cap ? p->active_cap * 2 : 16;
+				ior_iocp_op **active = realloc(p->active, cap * sizeof(*active));
+				WSAPOLLFD *pfds = realloc(p->pfds, (cap + 1) * sizeof(*pfds));
+				if (active) {
+					p->active = active;
+				}
+				if (pfds) {
+					p->pfds = pfds;
+				}
+				if (!active || !pfds) {
+					post_armed_op(ctx, in, ERROR_NOT_ENOUGH_MEMORY);
+					in = next;
+					continue;
+				}
+				p->active_cap = cap;
+			}
+			p->active[p->active_len] = in;
+			p->pfds[p->active_len + 1].fd = (SOCKET) in->fd;
+			p->pfds[p->active_len + 1].events = ior_poll_mask_to_wsa(in->poll_mask);
+			p->active_len++;
+			in = next;
+		}
+
+		if (atomic_load(&p->stop)) {
+			break;
+		}
+
+		// Drop ops whose link timeout fired (flagged by the timer thread).
+		for (uint32_t i = 0; i < p->active_len;) {
+			ior_iocp_op *op = p->active[i];
+			if (atomic_load_explicit(&op->token.cancelled, memory_order_acquire)) {
+				iocp_poller_remove(p, i);
+				post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
+			} else {
+				i++;
+			}
+		}
+
+		p->pfds[0].fd = p->wake_rx;
+		p->pfds[0].events = POLLRDNORM;
+		for (uint32_t i = 0; i <= p->active_len; i++) {
+			p->pfds[i].revents = 0;
+		}
+
+		int n = WSAPoll(p->pfds, p->active_len + 1, -1);
+		if (n == SOCKET_ERROR) {
+			// No per-socket status to act on; fail everything rather than spin.
+			DWORD err = (DWORD) WSAGetLastError();
+			while (p->active_len > 0) {
+				ior_iocp_op *op = p->active[0];
+				iocp_poller_remove(p, 0);
+				post_armed_op(ctx, op, err);
+			}
+			continue;
+		}
+
+		if (p->pfds[0].revents) {
+			iocp_poller_drain_wake(p);
+		}
+		for (uint32_t i = 0; i < p->active_len;) {
+			SHORT revents = p->pfds[i + 1].revents;
+			if (revents) {
+				ior_iocp_op *op = p->active[i];
+				iocp_poller_remove(p, i);
+				iocp_poller_post(ctx, op, revents);
+			} else {
+				i++;
+			}
+		}
+	}
+
+	// Shutdown: fail everything still pending, including late arrivals.
+	EnterCriticalSection(&p->lock);
+	ior_iocp_op *in = p->incoming;
+	p->incoming = NULL;
+	LeaveCriticalSection(&p->lock);
+	while (in) {
+		ior_iocp_op *next = in->next_pending;
+		in->next_pending = NULL;
+		post_armed_op(ctx, in, ERROR_OPERATION_ABORTED);
+		in = next;
+	}
+	while (p->active_len > 0) {
+		ior_iocp_op *op = p->active[0];
+		iocp_poller_remove(p, 0);
+		post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
+	}
+	return 0;
+}
+
+/*
+ * One-time (per context) creation of the wakeup socket pair and the poller
+ * thread. Assumes WSAStartup has been done by the application (it must have
+ * been, to own sockets worth polling).
+ */
+static int iocp_poller_ensure(ior_ctx_iocp *ctx)
+{
+	iocp_poller *p = &ctx->poller;
+
+	EnterCriticalSection(&p->lock);
+	if (p->thread) {
+		LeaveCriticalSection(&p->lock);
+		return 0;
+	}
+
+	int ret = -ENOMEM;
+	SOCKET rx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	SOCKET tx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (rx == INVALID_SOCKET || tx == INVALID_SOCKET) {
+		goto fail;
+	}
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = 0;
+	int alen = sizeof(addr);
+	if (bind(rx, (struct sockaddr *) &addr, sizeof(addr)) != 0
+			|| getsockname(rx, (struct sockaddr *) &addr, &alen) != 0
+			|| connect(tx, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+		goto fail;
+	}
+	u_long nonblock = 1;
+	if (ioctlsocket(rx, FIONBIO, &nonblock) != 0) {
+		goto fail;
+	}
+
+	// Pre-size the arrays: the thread may run before the first registration
+	// arrives and always needs the wake slot pfds[0].
+	p->active_cap = 16;
+	p->active = malloc(p->active_cap * sizeof(*p->active));
+	p->pfds = malloc((p->active_cap + 1) * sizeof(*p->pfds));
+	if (!p->active || !p->pfds) {
+		goto fail;
+	}
+
+	p->wake_rx = rx;
+	p->wake_tx = tx;
+	p->thread = CreateThread(NULL, 0, iocp_poller_thread_main, ctx, 0, NULL);
+	if (!p->thread) {
+		p->wake_rx = INVALID_SOCKET;
+		p->wake_tx = INVALID_SOCKET;
+		goto fail;
+	}
+
+	LeaveCriticalSection(&p->lock);
+	return 0;
+
+fail:
+	free(p->active);
+	free(p->pfds);
+	p->active = NULL;
+	p->pfds = NULL;
+	p->active_cap = 0;
+	if (rx != INVALID_SOCKET) {
+		closesocket(rx);
+	}
+	if (tx != INVALID_SOCKET) {
+		closesocket(tx);
+	}
+	LeaveCriticalSection(&p->lock);
+	return ret;
+}
+
+static int issue_poll(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (iocp_poller_ensure(ctx) < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
+	atomic_init(&op->token.cancelled, 0);
+	op->token.shutdown = &ctx->shutdown;
+
+	// Reserve the active_count slot up front, like issue_work: the poller
+	// thread completes the op, so it must post with the slot already held.
+	atomic_fetch_add(&ctx->active_count, 1);
+
+	iocp_poller *p = &ctx->poller;
+	EnterCriticalSection(&p->lock);
+	op->next_pending = p->incoming;
+	p->incoming = op;
+	LeaveCriticalSection(&p->lock);
+	iocp_poller_wake(p);
+
+	return 0;
+}
+
 static void op_to_cqe(ior_iocp_op *op)
 {
 	op->cqe.iocp.user_data = op->user_data;
@@ -872,8 +1174,8 @@ static void op_to_cqe(ior_iocp_op *op)
 
 	if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
-	} else if (op->opcode == IOR_OP_WORK) {
-		// The callback's return value, which may legitimately be negative.
+	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL) {
+		// The callback's return value (or ready poll mask), not a byte count.
 		op->cqe.iocp.res = op->work_res;
 	} else {
 		op->cqe.iocp.res = (int32_t) op->bytes_transferred;
@@ -1099,13 +1401,19 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			 * the guarded op is guaranteed alive here.
 			 */
 			ior_iocp_op *guarded = op->guarded;
-			bool is_work = guarded->opcode == IOR_OP_WORK;
-			if (is_work) {
+			// Work and poll ops have no OVERLAPPED I/O to cancel: flag their
+			// token instead (the poller drops a flagged op once woken).
+			bool token_cancel
+					= guarded->opcode == IOR_OP_WORK || guarded->opcode == IOR_OP_POLL;
+			bool is_poll = guarded->opcode == IOR_OP_POLL;
+			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
 			}
 			LeaveCriticalSection(&tm->lock);
-			if (!is_work) {
+			if (!token_cancel) {
 				CancelIoEx((HANDLE) guarded->fd, &guarded->overlapped);
+			} else if (is_poll) {
+				iocp_poller_wake(&ctx->poller);
 			}
 			post_armed_op(ctx, op, ERROR_TIMEOUT);
 			EnterCriticalSection(&tm->lock);
@@ -1345,6 +1653,12 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			ret = issue_work(ctx, op);
 			break;
 
+		case IOR_OP_POLL:
+			// Like WORK, a guarded poll's deadline is watched by the timer
+			// thread, which flags the token and wakes the poller.
+			ret = issue_poll(ctx, op);
+			break;
+
 		case IOR_OP_TIMER:
 			return arm_timer(ctx, op);
 
@@ -1485,9 +1799,15 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		return -ENOMEM;
 	}
 
+	// Poller bookkeeping; the thread and wakeup sockets are created lazily.
+	InitializeCriticalSection(&ctx->poller.lock);
+	ctx->poller.wake_tx = INVALID_SOCKET;
+	ctx->poller.wake_rx = INVALID_SOCKET;
+	atomic_store(&ctx->poller.stop, 0);
+
 	atomic_store(&ctx->shutdown, 0);
 
-	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK;
+	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK | IOR_FEAT_POLL_ADD;
 	params->features = ctx->features;
 
 	*backend_ctx = ctx;
@@ -1526,6 +1846,23 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 
 	WaitForSingleObject(ctx->timers.thread, INFINITE);
 	CloseHandle(ctx->timers.thread);
+
+	/*
+	 * Stop the poller thread (after the timer thread, which may still wake it
+	 * for cancelled poll ops). Pending polls are posted as -ECANCELED and
+	 * reclaimed by the drain loop below.
+	 */
+	if (ctx->poller.thread) {
+		atomic_store(&ctx->poller.stop, 1);
+		iocp_poller_wake(&ctx->poller);
+		WaitForSingleObject(ctx->poller.thread, INFINITE);
+		CloseHandle(ctx->poller.thread);
+		closesocket(ctx->poller.wake_tx);
+		closesocket(ctx->poller.wake_rx);
+		free(ctx->poller.active);
+		free(ctx->poller.pfds);
+	}
+	DeleteCriticalSection(&ctx->poller.lock);
 
 	// Drain timers without posting
 	EnterCriticalSection(&ctx->timers.lock);
@@ -1669,8 +2006,10 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
 
 		// A link timeout already paired with its guarded op is armed when that
-		// op is issued, not submitted as a standalone op. Skip it here.
+		// op is issued, not submitted as a standalone op. Still count it: its
+		// SQE was consumed, and other backends report both entries of the pair.
 		if (op->opcode == IOR_OP_LINK_TIMEOUT && op->guarded) {
+			submitted++;
 			prev = op;
 			continue;
 		}
@@ -2211,6 +2550,15 @@ static void ior_iocp_backend_prep_recv(
 	op->sock_flags = (DWORD) flags;
 }
 
+static void ior_iocp_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_POLL;
+	op->fd = fd;
+	op->poll_mask = poll_mask;
+}
+
 static int ior_iocp_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	(void) backend_ctx;
@@ -2289,6 +2637,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_link_timeout = ior_iocp_backend_prep_link_timeout,
 	.prep_send = ior_iocp_backend_prep_send,
 	.prep_recv = ior_iocp_backend_prep_recv,
+	.prep_poll_add = ior_iocp_backend_prep_poll_add,
 	.prep_work = ior_iocp_backend_prep_work,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,

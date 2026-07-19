@@ -114,6 +114,86 @@ static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, c
 	atomic_fetch_sub(&pool->num_inflight, 1);
 }
 
+/*
+ * Resolve a poll op handed off to the poller thread. The chain layout is
+ * recovered from the work item itself: an immediately following LINK_TIMEOUT
+ * is the guarding pair, anything after belongs to the chain remainder, which
+ * resumes on the worker pool on success or is cancelled on failure.
+ */
+static void ior_threads_pool_poll_done(void *owner, void *req, int res)
+{
+	ior_threads_pool *pool = owner;
+	ior_work *w = req;
+	uint64_t count = 1;
+
+	ior_work *lt = NULL;
+	if ((w->sqe.threads.flags & IOR_SQE_IO_LINK) && w->chain
+			&& w->chain->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
+		lt = w->chain;
+	}
+	ior_work *rest = lt ? lt->chain : w->chain;
+	int failed = res < 0;
+
+	ior_cqe cqe;
+	memset(&cqe, 0, sizeof(cqe));
+	cqe.threads.user_data = w->sqe.threads.user_data;
+	// A poller deadline is a fired link timeout: the guarded poll is cancelled.
+	cqe.threads.res = (res == -ETIME) ? -ECANCELED : res;
+	ior_threads_pool_finish_op(pool, w, &cqe);
+
+	if (lt) {
+		ior_cqe lcqe;
+		memset(&lcqe, 0, sizeof(lcqe));
+		lcqe.threads.user_data = lt->sqe.threads.user_data;
+		lcqe.threads.res = (res == -ETIME) ? -ETIME : -ECANCELED;
+		ior_threads_pool_finish_op(pool, lt, &lcqe);
+		count++;
+	}
+
+	if (rest) {
+		if (failed) {
+			// A failed linked op cancels the remainder, matching io_uring.
+			ior_work *r = rest;
+			while (r) {
+				ior_work *next = r->chain;
+				ior_cqe rcqe;
+				memset(&rcqe, 0, sizeof(rcqe));
+				rcqe.threads.user_data = r->sqe.threads.user_data;
+				rcqe.threads.res = -ECANCELED;
+				ior_threads_pool_finish_op(pool, r, &rcqe);
+				count++;
+				r = next;
+			}
+		} else {
+			rest->job.next = NULL;
+			ior_worker_pool_submit(pool->wp, &rest->job, &rest->job, 1);
+		}
+	}
+
+	atomic_fetch_add(&pool->tasks_completed, count);
+}
+
+/* Get or lazily create the shared poller (NULL on allocation failure). */
+static ior_threads_poller *ior_threads_pool_get_poller(ior_threads_pool *pool)
+{
+	ior_threads_poller *poller = atomic_load_explicit(&pool->poller, memory_order_acquire);
+	if (poller) {
+		return poller;
+	}
+
+	pthread_mutex_lock(&pool->work_lock);
+	poller = atomic_load_explicit(&pool->poller, memory_order_relaxed);
+	if (!poller) {
+		if (ior_threads_poller_create(&poller, pool, ior_threads_pool_poll_done) < 0) {
+			poller = NULL;
+		} else {
+			atomic_store_explicit(&pool->poller, poller, memory_order_release);
+		}
+	}
+	pthread_mutex_unlock(&pool->work_lock);
+	return poller;
+}
+
 ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_threads)
 {
 	ior_threads_pool_config config = {
@@ -140,6 +220,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 
 	pool->ctx = ctx;
 	atomic_init(&pool->tasks_completed, 0);
+	atomic_init(&pool->poller, NULL);
 
 	/*
 	 * Work-item pool (free-at-submit). Capacity matches the CQ (the in-flight
@@ -278,6 +359,10 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	// timers without posting completions, and joins all threads.
 	ior_worker_pool_destroy(pool->wp);
 
+	// Workers are joined, so no new poll registrations can arrive; pending
+	// polls complete with -ECANCELED before the poller thread exits.
+	ior_threads_poller_destroy(atomic_load(&pool->poller));
+
 	// Cleanup
 	pthread_cond_destroy(&pool->drain_cond);
 	pthread_mutex_destroy(&pool->drain_lock);
@@ -359,6 +444,54 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		if (w->sqe.threads.opcode == IOR_OP_TIMER) {
 			int linked = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
 			ior_threads_pool_arm_timer(pool, w);
+			count++;
+			if (linked) {
+				cancel = 1;
+			}
+			w = next;
+			continue;
+		}
+
+		/*
+		 * Poll ops never block a worker: hand them (with their guarding link
+		 * timeout and chain remainder) to the poller thread, which resolves
+		 * them in ior_threads_pool_poll_done.
+		 */
+		if (w->sqe.threads.opcode == IOR_OP_POLL) {
+			ior_work *lt = NULL;
+			if ((w->sqe.threads.flags & IOR_SQE_IO_LINK) && next
+					&& next->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
+				lt = next;
+			}
+			uint64_t deadline_ns = 0;
+			if (lt) {
+				ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
+				if (ts) {
+					uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+					if (!(lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)) {
+						ns += ior_worker_pool_monotonic_ns();
+					}
+					deadline_ns = ns ? ns : 1; // 0 means "no deadline"
+				}
+			}
+
+			ior_threads_poller *poller = ior_threads_pool_get_poller(pool);
+			int ret = poller ? ior_threads_poller_add(poller, w->sqe.threads.fd,
+									  w->sqe.threads.poll_events, deadline_ns, w)
+							 : -ENOMEM;
+			if (ret == 0) {
+				// Ownership of w and its whole chain moved to the poller.
+				atomic_fetch_add(&pool->tasks_completed, count);
+				return;
+			}
+
+			// Registration failed: fail the op here, cancel any linked rest.
+			int linked = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
+			ior_cqe cqe;
+			memset(&cqe, 0, sizeof(cqe));
+			cqe.threads.user_data = w->sqe.threads.user_data;
+			cqe.threads.res = ret;
+			ior_threads_pool_finish_op(pool, w, &cqe);
 			count++;
 			if (linked) {
 				cancel = 1;

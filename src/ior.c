@@ -211,6 +211,13 @@ void ior_prep_recv(
 	}
 }
 
+void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_poll_add(sqe, fd, poll_mask);
+	}
+}
+
 int ior_prep_work(ior_ctx *ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	if (!ctx || !sqe || !fn) {

@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <poll.h>
 #include <liburing.h>
 
 typedef struct ior_uring_job ior_uring_job;
@@ -324,16 +325,8 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 		return ret;
 	}
 
-	// Set features
-	ctx->features = IOR_FEAT_NATIVE_ASYNC;
-
-#ifdef IORING_FEAT_FAST_POLL
-	if (uring_params.features & IORING_FEAT_FAST_POLL) {
-		ctx->features |= IOR_FEAT_POLL_ADD;
-	}
-#endif
-
-	ctx->features |= IOR_FEAT_SPLICE;
+	// Set features. IORING_OP_POLL_ADD exists on every supported kernel.
+	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_POLL_ADD | IOR_FEAT_SPLICE;
 
 	/*
 	 * Work ops are mandatory and need CQE_SKIP (5.17) + MSG_RING (5.18).
@@ -591,6 +584,20 @@ static void ior_uring_backend_prep_recv(
 	io_uring_prep_recv(s, (int) sockfd, buf, nbytes, flags);
 }
 
+/* IOR_POLL_* values match the kernel's poll bits, so masks and the CQE res
+ * pass through unchanged. */
+_Static_assert(IOR_POLL_IN == POLLIN, "IOR_POLL_IN must match POLLIN");
+_Static_assert(IOR_POLL_OUT == POLLOUT, "IOR_POLL_OUT must match POLLOUT");
+_Static_assert(IOR_POLL_ERR == POLLERR, "IOR_POLL_ERR must match POLLERR");
+_Static_assert(IOR_POLL_HUP == POLLHUP, "IOR_POLL_HUP must match POLLHUP");
+_Static_assert(IOR_POLL_NVAL == POLLNVAL, "IOR_POLL_NVAL must match POLLNVAL");
+
+static void ior_uring_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_poll_add(s, (int) fd, poll_mask);
+}
+
 static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	ior_ctx_uring *ctx = backend_ctx;
@@ -721,6 +728,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_link_timeout = ior_uring_backend_prep_link_timeout,
 	.prep_send = ior_uring_backend_prep_send,
 	.prep_recv = ior_uring_backend_prep_recv,
+	.prep_poll_add = ior_uring_backend_prep_poll_add,
 	.prep_work = ior_uring_backend_prep_work,
 	.sqe_set_data = ior_uring_backend_sqe_set_data,
 	.sqe_set_flags = ior_uring_backend_sqe_set_flags,

@@ -115,6 +115,7 @@ option(IOR_BUILD_BENCH "Build the ior_bench benchmark tool" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
 option(IOR_FORCE_THREADS "Force thread backend even if io_uring available (testing)" OFF)
 option(IOR_FORCE_PIPE "Force pipe for thread event notification (testing)" OFF)
+option(IOR_FORCE_POLL "Force poll() for the readiness poller even if epoll/kqueue is available (testing)" OFF)
 option(IOR_ENABLE_LOG "Enable logging system" OFF)
 
 if(IOR_ENABLE_LOG)
@@ -338,6 +339,41 @@ if((IOR_PLATFORM_LINUX OR IOR_PLATFORM_FREEBSD) AND NOT IOR_FORCE_PIPE)
     endif()
 endif()
 
+# Check for epoll (readiness poller for the thread backend)
+set(IOR_HAVE_EPOLL FALSE)
+if(IOR_PLATFORM_LINUX AND NOT IOR_FORCE_POLL)
+    check_c_source_compiles("
+        #include <sys/epoll.h>
+        int main(void) {
+            int fd = epoll_create1(EPOLL_CLOEXEC);
+            return fd >= 0 ? 0 : 1;
+        }
+    " HAVE_EPOLL)
+
+    if(HAVE_EPOLL)
+        set(IOR_HAVE_EPOLL TRUE)
+        message(STATUS "epoll available")
+    endif()
+endif()
+
+# Check for kqueue (readiness poller on BSD/macOS)
+set(IOR_HAVE_KQUEUE FALSE)
+if((IOR_PLATFORM_FREEBSD OR IOR_PLATFORM_OPENBSD OR IOR_PLATFORM_MACOS) AND NOT IOR_FORCE_POLL)
+    check_c_source_compiles("
+        #include <sys/types.h>
+        #include <sys/event.h>
+        int main(void) {
+            int kq = kqueue();
+            return kq >= 0 ? 0 : 1;
+        }
+    " HAVE_KQUEUE)
+
+    if(HAVE_KQUEUE)
+        set(IOR_HAVE_KQUEUE TRUE)
+        message(STATUS "kqueue available")
+    endif()
+endif()
+
 # Check for Windows IOCP
 set(IOR_HAVE_IOCP FALSE)
 if(IOR_PLATFORM_WINDOWS)
@@ -362,6 +398,15 @@ if(IOR_HAVE_THREADS)
         message(STATUS "Using eventfd for thread event notification")
     else()
         message(STATUS "Using pipe for thread event notification")
+    endif()
+
+    # Readiness poller implementation
+    if(IOR_HAVE_EPOLL)
+        message(STATUS "Using epoll for the readiness poller")
+    elseif(IOR_HAVE_KQUEUE)
+        message(STATUS "Using kqueue for the readiness poller")
+    else()
+        message(STATUS "Using poll for the readiness poller")
     endif()
 else()
     message(STATUS "Thread backend disabled (not needed)")
@@ -433,6 +478,8 @@ endif()
 message(STATUS "")
 message(STATUS "Features:")
 message(STATUS "  eventfd:     ${IOR_HAVE_EVENTFD}")
+message(STATUS "  epoll:       ${IOR_HAVE_EPOLL}")
+message(STATUS "  kqueue:      ${IOR_HAVE_KQUEUE}")
 message(STATUS "  splice:      ${IOR_HAVE_SPLICE}")
 message(STATUS "")
 message(STATUS "Build Options:")

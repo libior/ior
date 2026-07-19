@@ -48,6 +48,7 @@ typedef struct ior_sqe_threads {
 		uint32_t rw_flags;
 		uint32_t splice_flags;
 		uint32_t timeout_flags;
+		uint32_t poll_events;
 	};
 	uint64_t user_data;
 	union {
@@ -146,6 +147,7 @@ typedef struct ior_backend_ops {
 	void (*prep_link_timeout)(ior_sqe *sqe, ior_timespec *ts, unsigned flags);
 	void (*prep_send)(ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
 	void (*prep_recv)(ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
+	void (*prep_poll_add)(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some
 	 * backends record per-op state beyond the SQE (e.g. io_uring's job list). */
 	int (*prep_work)(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);

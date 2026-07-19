@@ -24,6 +24,7 @@ set(TESTS
     test_timeout
     test_edge
     test_socket
+    test_poll
     test_concurrency
     test_link_timeout
     test_slow_op
