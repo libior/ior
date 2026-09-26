@@ -290,6 +290,7 @@ endif()
 
 # Check for liburing on Linux
 set(IOR_HAVE_URING FALSE)
+set(IOR_HAVE_URING_WAITID FALSE)
 set(IOR_URING_VERSION "unknown")
 
 if(IOR_PLATFORM_LINUX AND IOR_WITH_URING)
@@ -336,6 +337,26 @@ if(IOR_PLATFORM_LINUX AND IOR_WITH_URING)
 
                 if(HAVE_URING_MSG_RING)
                     set(IOR_HAVE_URING TRUE)
+
+                    # IORING_OP_WAITID (kernel 6.7, liburing 2.5): a wait for
+                    # any child, a process group or stop and continue reports
+                    # without a thread, cancelled without reaping. Used when
+                    # the kernel has it; sync cancel (6.0) retires such waits
+                    # at teardown.
+                    check_c_source_compiles("
+                        #include <liburing.h>
+                        int main(void) {
+                            struct io_uring_sqe sqe;
+                            siginfo_t info;
+                            struct io_uring_sync_cancel_reg reg;
+                            io_uring_prep_waitid(&sqe, P_ALL, 0, &info, WEXITED, 0);
+                            (void) reg;
+                            return IORING_OP_WAITID != 0 && io_uring_register_sync_cancel != 0 ? 0 : 1;
+                        }
+                    " HAVE_URING_WAITID)
+                    if(HAVE_URING_WAITID)
+                        set(IOR_HAVE_URING_WAITID TRUE)
+                    endif()
                 else()
                     message(STATUS "liburing lacks msg_ring/cancel_fd (needs 2.2+) - io_uring disabled")
                 endif()

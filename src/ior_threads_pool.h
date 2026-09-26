@@ -102,6 +102,7 @@ typedef struct ior_work {
 	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
 	struct ior_threads_pool_lt_arb
 			*arb; // link-timeout arbitration of a work, signal or process wait
+	uint64_t probe_ns; // waitpid op probed from the timer: the next interval
 	struct ior_work_token token; // IOR_OP_WORK, IOR_OP_SIGWAIT: cancellation handle
 } ior_work;
 

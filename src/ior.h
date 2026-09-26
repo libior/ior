@@ -656,8 +656,8 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *   - if the guarded op finishes first, it reports its normal result and this
  *     link timeout completes with res == -ECANCELED;
  *   - if @p ts elapses while the guarded op runs and cannot be stopped (a
- *     work callback, a process wait that holds a worker thread, a signal
- *     wait blocked in sigwait(3) where there is no sigtimedwait), this link
+ *     work callback, a signal wait blocked in sigwait(3) where there is no
+ *     sigtimedwait), this link
  *     timeout completes at the deadline with res == -EALREADY, as io_uring's
  *     does for a running request, and the guarded op completes with its own
  *     result once it ends. Its memory stays in use until then.
@@ -776,15 +776,17 @@ void ior_prep_connect(
  * the caller runs and with WAITPID ops on -1, as waitpid calls do among
  * themselves.
  *
- * A wait for one child (@p pid > 0, no options) occupies no thread: io_uring
- * polls a pidfd, the thread backend parks the op on its poller (a pidfd on
- * Linux, EVFILT_PROC on kqueue) and IOCP registers a wait on the process
- * handle, so the op is cancellable and a link timeout bounds it. Every other
- * request (-1 for any child, a process group, WUNTRACED or WCONTINUED, or a
- * platform without a process watch) blocks a worker thread in waitpid(2)
- * until it returns: a cancel then reports -EALREADY, a link timeout completes
- * at its deadline with -EALREADY while the op completes when waitpid(2)
- * returns (see ior_prep_link_timeout()), and ior_queue_exit() waits for it.
+ * No wait occupies a thread, whatever it asks for: a cancel takes it back
+ * without reaping anything (0, the op -ECANCELED), a link timeout ends it at
+ * its deadline the same way, and ior_queue_exit() does not wait for the
+ * child. io_uring asks the kernel (IORING_OP_WAITID, Linux 6.7). Elsewhere a
+ * wait for one child (@p pid > 0, no options) is watched: a pidfd poll on
+ * io_uring, the thread backend's poller (a pidfd on Linux, EVFILT_PROC on
+ * kqueue), a wait on the process handle on IOCP. Every other request (-1
+ * for any child, a process group, WUNTRACED or WCONTINUED, or a platform
+ * without a process watch) is probed with waitpid(WNOHANG) from a timer,
+ * first at once and then at intervals doubling from 1 ms to 20 ms, so it
+ * sees a change up to that much later than waitpid(2) would.
  *
  * Windows accepts only @p pid > 0 (-ENOTSUP otherwise), ignores @p options
  * and stores the exit code in @p status. Any process can be waited for

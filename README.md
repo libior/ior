@@ -28,9 +28,11 @@ The goal is to provide maximum performance on platforms with native async I/O su
   `IORING_POLL_ADD_MULTI` on io_uring, an edge-triggered watch (`EPOLLET`,
   `EV_CLEAR`) on the thread pool's poller, the WSAPoll readiness emulation on
   Windows
-- Process waits (`ior_prep_waitpid`): a pidfd poll on io_uring, a parked
-  op on the thread pool's poller (pidfd or `EVFILT_PROC`), a threadpool
-  wait on the process handle on Windows
+- Process waits (`ior_prep_waitpid`): `IORING_OP_WAITID` on io_uring (Linux
+  6.7, else a pidfd poll), a parked op on the thread pool's poller (pidfd or
+  `EVFILT_PROC`), a threadpool wait on the process handle on Windows; what
+  nothing can watch (any child, a process group, stop and continue reports)
+  is probed from a timer, so no wait holds a thread
 - Signal waits (`ior_prep_sigwait`): a signalfd poll on io_uring, a worker
   in `sigtimedwait` on the thread pool, the console control events
   (`SIGINT`, `SIGBREAK`) on Windows
@@ -292,11 +294,12 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
 void ior_prep_poll_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 
 // Wait for a process like waitpid(2): completes with its pid, the wait
-// status in *status (the exit code on Windows), or -ECHILD. A wait for one
-// child with no options occupies no thread and is cancellable; -1, a
-// process group, WUNTRACED/WCONTINUED block a worker until waitpid returns
-// (a cancel then reports -EALREADY, as does a link timeout at its deadline).
-// Windows takes only pid > 0.
+// status in *status (the exit code on Windows), or -ECHILD. No wait holds a
+// thread: a cancel or a link timeout takes it back without reaping, and
+// ior_queue_exit() does not wait for the child. -1, a process group and
+// WUNTRACED/WCONTINUED are probed every 1-20 ms where the kernel cannot wait
+// for them (io_uring before Linux 6.7, the thread pool). Windows takes only
+// pid > 0.
 int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status,
                      int options);
 

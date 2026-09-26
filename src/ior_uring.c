@@ -7,6 +7,7 @@
 #include "ior_worker_pool.h"
 #include <stdlib.h>
 #include <stddef.h>
+#include <limits.h>
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
@@ -72,8 +73,8 @@ typedef struct ior_ctx_uring {
 	ior_uring_job *jobs_head; // doubly linked via live_next/live_prev
 
 	/*
-	 * IOR_OP_WAITPID on one running child and IOR_OP_SIGWAIT: a POLL_ADD on
-	 * a pidfd or a signalfd whose kernel user_data is the wait record, so
+	 * IOR_OP_WAITPID and IOR_OP_SIGWAIT: an IORING_OP_WAITID, or a POLL_ADD
+	 * on a pidfd or a signalfd, whose kernel user_data is the wait record, so
 	 * its CQE can be told apart on the way out and rewritten into the
 	 * waitpid or sigwait result (see ior_uring_resolve_waits). Records are
 	 * prepped on waits_pending and moved into waits_live at submit: lists
@@ -87,6 +88,7 @@ typedef struct ior_ctx_uring {
 	_Atomic uint32_t waits_live_count;
 
 	int notify_fd; // eventfd registered with the ring; -1 until requested
+	int has_waitid; // the kernel has IORING_OP_WAITID (6.7)
 
 	/*
 	 * Per SQ slot, set by ior_uring_scan_staged(): the entry is in a chain the
@@ -97,16 +99,31 @@ typedef struct ior_ctx_uring {
 	int sq_needs_scan; // an entry submit checks may be staged (prep_checked)
 } ior_ctx_uring;
 
+/*
+ * What a wait record stands for. A WAITID the kernel cancels, from a cancel
+ * or a link timeout, has the canceller complete with the number of requests
+ * cancelled (1) rather than 0 or -ETIME, so ior keys those two by a record
+ * of their own too and puts the io_uring result back.
+ */
+enum {
+	IOR_URING_WAIT_PIDFD = 0, // a POLL_ADD on a pidfd: the child exited
+	IOR_URING_WAIT_SIG, // a POLL_ADD on a signalfd: info gets the signal
+	IOR_URING_WAIT_WAITID, // an IORING_OP_WAITID
+	IOR_URING_WAIT_CANCEL, // a cancel aimed at a WAITID: 0, not the count
+	IOR_URING_WAIT_LT, // a link timeout guarding a WAITID: -ETIME, not the count
+};
+
 struct ior_uring_wait {
 	ior_uring_wait *next;
 	ior_uring_wait *prev; // live lists only
-	int fd; // the pidfd or signalfd polled
-	int is_sig; // a sigwait: fd is a signalfd, info gets the signal
+	int kind; // IOR_URING_WAIT_*
+	int fd; // the pidfd or signalfd polled, -1 for the other kinds
 	pid_t pid;
 	int *status;
 	ior_siginfo_t *info;
+	siginfo_t si; // WAITID: the kernel writes it until the CQE is out
 	uint64_t user_data; // the caller's, harvested at submit
-	struct io_uring_sqe *ksqe; // the POLL_ADD; valid only until submit
+	struct io_uring_sqe *ksqe; // the kernel op; valid only until submit
 };
 
 /*
@@ -144,10 +161,12 @@ struct ior_uring_job {
 	uint64_t lt_user_data;
 	_Atomic int lt_posted;
 
-	// IOR_OP_WAITPID run as a job: a worker's waitpid(2).
+	// IOR_OP_WAITPID probed from the timer thread (no IORING_OP_WAITID).
 	pid_t wait_pid;
 	int *wait_status;
 	int wait_options;
+	int probe; // not a callback: the timer probes the wait, see below
+	uint64_t probe_ns; // the next probe interval; its address keys the timer
 
 	struct ior_work_token token;
 	_Atomic int state;
@@ -358,6 +377,22 @@ static int ior_uring_wait_cqes(
 	}
 }
 
+// Post a job's result, and its link timeout's unless the timer did.
+static void ior_uring_job_finish(ior_ctx_uring *ctx, ior_uring_job *job, int32_t res)
+{
+	// Unless the timer posted it while the op ran, the link timeout resolves
+	// as "op finished first".
+	int post_lt = job->has_lt && !atomic_exchange(&job->lt_posted, 1);
+	atomic_store(&job->state, IOR_URING_JOB_DONE);
+
+	ior_uring_post_cqe(ctx, job->user_data, res);
+	if (post_lt) {
+		ior_uring_post_cqe(ctx, job->lt_user_data, -ECANCELED);
+	}
+
+	ior_uring_job_release(job);
+}
+
 // Executes one work job on a pool worker thread.
 static void ior_uring_run_job(void *owner, ior_worker_pool_job *pj)
 {
@@ -372,18 +407,66 @@ static void ior_uring_run_job(void *owner, ior_worker_pool_job *pj)
 		return;
 	}
 
-	int32_t res = job->fn(&job->token, job->arg);
-	// Unless the timer posted it while the callback ran, the link timeout
-	// resolves as "op finished first".
-	int post_lt = job->has_lt && !atomic_exchange(&job->lt_posted, 1);
-	atomic_store(&job->state, IOR_URING_JOB_DONE);
+	ior_uring_job_finish(ctx, job, job->fn(&job->token, job->arg));
+}
 
-	ior_uring_post_cqe(ctx, job->user_data, res);
-	if (post_lt) {
-		ior_uring_post_cqe(ctx, job->lt_user_data, -ECANCELED);
+static void ior_uring_probe_dropped(void *owner, void *arg);
+
+/*
+ * Timer side of a probed process wait. Claimed like a job a worker starts
+ * (QUEUED -> RUNNING), so a cancel or a link timeout that got there first
+ * wins and the child is left alone. waitpid(WNOHANG) cannot block; with
+ * nothing to report the wait goes back to QUEUED and the timer, at an
+ * interval that doubles up to IOR_WAITPID_PROBE_MAX_NS. A cancel that came
+ * during the probe (-EALREADY) ends it then, unreaped.
+ */
+static void ior_uring_probe_fired(void *owner, void *arg)
+{
+	ior_ctx_uring *ctx = owner;
+	ior_uring_job *job = (ior_uring_job *) ((char *) arg - offsetof(ior_uring_job, probe_ns));
+
+	int expected = IOR_URING_JOB_QUEUED;
+	if (!atomic_compare_exchange_strong(&job->state, &expected, IOR_URING_JOB_RUNNING)) {
+		ior_uring_job_release(job); // cancelled; its completions are out
+		return;
 	}
+	pid_t r;
+	do {
+		r = waitpid(job->wait_pid, job->wait_status, job->wait_options | WNOHANG);
+	} while (r < 0 && errno == EINTR);
+	int32_t res = r < 0 ? -errno : r;
 
-	ior_uring_job_release(job);
+	if (res == 0 && !(job->wait_options & WNOHANG)) {
+		if (atomic_load_explicit(&job->token.cancelled, memory_order_acquire)) {
+			res = -ECANCELED;
+		} else {
+			job->probe_ns *= 2;
+			if (job->probe_ns > IOR_WAITPID_PROBE_MAX_NS) {
+				job->probe_ns = IOR_WAITPID_PROBE_MAX_NS;
+			}
+			atomic_store(&job->state, IOR_URING_JOB_QUEUED);
+			if (ior_worker_pool_arm_timer(ctx->wp, ior_worker_pool_monotonic_ns() + job->probe_ns,
+						ior_uring_probe_fired, ior_uring_probe_dropped, &job->probe_ns)
+					== 0) {
+				return;
+			}
+			// No memory to wait on: claim it back to fail it.
+			expected = IOR_URING_JOB_QUEUED;
+			if (!atomic_compare_exchange_strong(&job->state, &expected, IOR_URING_JOB_RUNNING)) {
+				ior_uring_job_release(job);
+				return;
+			}
+			res = -ENOMEM;
+		}
+	}
+	ior_uring_job_finish(ctx, job, res);
+}
+
+// Pool destroyed with the wait pending: drop the ref the probe held.
+static void ior_uring_probe_dropped(void *owner, void *arg)
+{
+	(void) owner;
+	ior_uring_job_release((ior_uring_job *) ((char *) arg - offsetof(ior_uring_job, probe_ns)));
 }
 
 // Timer-thread side of a link timeout on a work op.
@@ -518,6 +601,37 @@ static void ior_uring_backend_prep_checked(void *backend_ctx)
 	((ior_ctx_uring *) backend_ctx)->sq_needs_scan = 1;
 }
 
+// Make a record live under its own address (jobs_lock held).
+static void ior_uring_wait_link_locked(ior_ctx_uring *ctx, ior_uring_wait *wait)
+{
+	ior_uring_wait **head = ior_uring_wait_bucket(ctx, (uint64_t) (uintptr_t) wait);
+	wait->prev = NULL;
+	wait->next = *head;
+	if (*head) {
+		(*head)->prev = wait;
+	}
+	*head = wait;
+	atomic_fetch_add(&ctx->waits_live_count, 1);
+}
+
+/*
+ * Key the staged entry s (a cancel or a link timeout aimed at a WAITID) by a
+ * record that puts its io_uring result back (jobs_lock held). Without memory
+ * for one it keeps the kernel's count.
+ */
+static void ior_uring_wait_fixup_locked(ior_ctx_uring *ctx, struct io_uring_sqe *s, int kind)
+{
+	ior_uring_wait *fix = calloc(1, sizeof(*fix));
+	if (!fix) {
+		return;
+	}
+	fix->kind = kind;
+	fix->fd = -1;
+	fix->user_data = s->user_data;
+	s->user_data = (uint64_t) (uintptr_t) fix;
+	ior_uring_wait_link_locked(ctx, fix);
+}
+
 static void ior_uring_dispatch_waits(ior_ctx_uring *ctx, unsigned bound)
 {
 	ior_uring_wait *wait = ctx->waits_pending;
@@ -541,16 +655,16 @@ static void ior_uring_dispatch_waits(ior_ctx_uring *ctx, unsigned bound)
 		wait->ksqe->user_data = (uint64_t) (uintptr_t) wait;
 		// The pidfd or signalfd is ior's own, never a registered file.
 		wait->ksqe->flags &= (uint8_t) ~IOSQE_FIXED_FILE;
-		wait->ksqe = NULL;
-
-		ior_uring_wait **head = ior_uring_wait_bucket(ctx, (uint64_t) (uintptr_t) wait);
-		wait->prev = NULL;
-		wait->next = *head;
-		if (*head) {
-			(*head)->prev = wait;
+		if (wait->kind == IOR_URING_WAIT_WAITID && (wait->ksqe->flags & IOSQE_IO_LINK)) {
+			unsigned pos = ior_uring_sq_pos(ctx, wait->ksqe);
+			struct io_uring_sqe *lt
+					= &ctx->ring.sq.sqes[(pos + 1) & (ctx->ring.sq.ring_entries - 1)];
+			if (pos + 1 - head < bound - head && lt->opcode == IORING_OP_LINK_TIMEOUT) {
+				ior_uring_wait_fixup_locked(ctx, lt, IOR_URING_WAIT_LT);
+			}
 		}
-		*head = wait;
-		atomic_fetch_add(&ctx->waits_live_count, 1);
+		wait->ksqe = NULL;
+		ior_uring_wait_link_locked(ctx, wait);
 		wait = next;
 	}
 	pthread_mutex_unlock(&ctx->jobs_lock);
@@ -644,14 +758,34 @@ static int32_t ior_uring_collect_signal(const ior_uring_wait *wait)
 	return (int32_t) ssi.ssi_signo;
 }
 
+// The waitpid(2) status of what waitid(2) reported.
+static int ior_uring_status_from_siginfo(const siginfo_t *si)
+{
+	switch (si->si_code) {
+		case CLD_EXITED:
+			return (si->si_status & 0xff) << 8;
+		case CLD_KILLED:
+			return si->si_status & 0x7f;
+		case CLD_DUMPED:
+			return (si->si_status & 0x7f) | 0x80;
+		case CLD_STOPPED:
+		case CLD_TRAPPED:
+			return ((si->si_status & 0xff) << 8) | 0x7f;
+		case CLD_CONTINUED:
+			return 0xffff;
+		default:
+			return 0;
+	}
+}
+
 /*
- * Turn the completions of pidfd and signalfd polls among cqes[] into
- * waitpid and sigwait results, in place (the CQ ring is mapped writable and
- * the kernel never reads a CQE back): a readable pidfd means the child
- * exited, so waitpid(2) collects its state now, on the reaping thread, and
- * a readable signalfd is read for its signal; a failed or cancelled poll
- * keeps its error. The caller's user data is restored either way and the
- * record retired, so seeing the same CQE again finds nothing to do.
+ * Turn the completions of wait records among cqes[] into waitpid and
+ * sigwait results, in place (the CQ ring is mapped writable and the kernel
+ * never reads a CQE back): a readable pidfd means the child exited, so
+ * waitpid(2) collects its state now, on the reaping thread, a readable
+ * signalfd is read for its signal, and a WAITID's siginfo becomes the pid and
+ * its status; a failed or cancelled op keeps its error. The caller's user data is restored either
+ * way and the record retired, so seeing the same CQE again finds nothing to do.
  */
 static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, unsigned n)
 {
@@ -667,13 +801,41 @@ static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cq
 			continue;
 		}
 		int32_t res = cqe->res;
-		if (res >= 0 && wait->is_sig) {
-			res = ior_uring_collect_signal(wait);
-		} else if (res >= 0) {
-			pid_t r = waitpid(wait->pid, wait->status, WNOHANG);
-			res = r < 0 ? -errno : r;
+		switch (wait->kind) {
+			case IOR_URING_WAIT_SIG:
+				if (res >= 0) {
+					res = ior_uring_collect_signal(wait);
+				}
+				break;
+			case IOR_URING_WAIT_PIDFD:
+				if (res >= 0) {
+					pid_t r = waitpid(wait->pid, wait->status, WNOHANG);
+					res = r < 0 ? -errno : r;
+				}
+				break;
+			case IOR_URING_WAIT_WAITID:
+				// No si_pid: WNOHANG and nothing changed, as waitpid's 0.
+				if (res >= 0) {
+					res = wait->si.si_pid;
+					if (res > 0 && wait->status) {
+						*wait->status = ior_uring_status_from_siginfo(&wait->si);
+					}
+				}
+				break;
+			case IOR_URING_WAIT_CANCEL:
+				if (res > 0) {
+					res = 0;
+				}
+				break;
+			case IOR_URING_WAIT_LT:
+				if (res > 0) {
+					res = -ETIME;
+				}
+				break;
 		}
-		close(wait->fd);
+		if (wait->fd >= 0) {
+			close(wait->fd);
+		}
 		cqe->user_data = wait->user_data;
 		cqe->res = res;
 		ior_uring_wait_unlink_locked(ctx, wait);
@@ -809,6 +971,21 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx, unsigned bound)
 		job->live_linked = 1;
 		pthread_mutex_unlock(&ctx->jobs_lock);
 
+		if (job->probe) {
+			// First look at once; the probe holds the ref a worker would.
+			if (ior_worker_pool_arm_timer(ctx->wp, ior_worker_pool_monotonic_ns(),
+						ior_uring_probe_fired, ior_uring_probe_dropped, &job->probe_ns)
+					< 0) {
+				int expected = IOR_URING_JOB_QUEUED;
+				if (atomic_compare_exchange_strong(&job->state, &expected, IOR_URING_JOB_RUNNING)) {
+					ior_uring_job_finish(ctx, job, -ENOMEM);
+				} else {
+					ior_uring_job_release(job);
+				}
+			}
+			continue;
+		}
+
 		job->pj.next = NULL;
 		if (last) {
 			last->next = &job->pj;
@@ -839,9 +1016,12 @@ static int ior_uring_cancel_job_locked(ior_ctx_uring *ctx, ior_uring_job *job, i
 		atomic_store_explicit(&job->token.cancelled, 1, memory_order_release);
 		ior_uring_job_unlink_locked(ctx, job);
 		job->cancel_drop = 0;
-		// Off the FIFO: the worker's ref is ours to drop. Otherwise a worker
-		// already popped it and drops its own ref when it sees CANCELLED.
-		if (ior_worker_pool_cancel_job(ctx->wp, &job->pj) == 0) {
+		// Off the FIFO (or the probe timer): the worker's ref is ours to
+		// drop. Otherwise a worker (the timer) already took it and drops its
+		// own ref when it sees CANCELLED.
+		int off = job->probe ? ior_worker_pool_cancel_timer(ctx->wp, &job->probe_ns)
+							 : ior_worker_pool_cancel_job(ctx->wp, &job->pj);
+		if (off == 0) {
 			job->cancel_drop++;
 		}
 		// The link timeout no longer needs to fire.
@@ -914,6 +1094,9 @@ static void ior_uring_intercept_cancels(ior_ctx_uring *ctx, unsigned bound)
 			}
 			if (found) {
 				s->addr = (uint64_t) (uintptr_t) found;
+				if (found->kind == IOR_URING_WAIT_WAITID) {
+					ior_uring_wait_fixup_locked(ctx, s, IOR_URING_WAIT_CANCEL);
+				}
 			}
 		}
 		pthread_mutex_unlock(&ctx->jobs_lock);
@@ -1000,6 +1183,9 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 		struct io_uring_probe *probe = io_uring_get_probe_ring(&ctx->ring);
 		if (probe) {
 			kernel_ok = io_uring_opcode_supported(probe, IORING_OP_MSG_RING);
+#ifdef IOR_HAVE_URING_WAITID
+			ctx->has_waitid = io_uring_opcode_supported(probe, IORING_OP_WAITID);
+#endif
 			io_uring_free_probe(probe);
 		}
 	}
@@ -1084,7 +1270,9 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 	ior_uring_wait *wait = ctx->waits_pending;
 	while (wait) {
 		ior_uring_wait *next = wait->next;
-		close(wait->fd);
+		if (wait->fd >= 0) {
+			close(wait->fd);
+		}
 		free(wait);
 		wait = next;
 	}
@@ -1092,7 +1280,22 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 		wait = ctx->waits_live[b];
 		while (wait) {
 			ior_uring_wait *next = wait->next;
-			close(wait->fd);
+#ifdef IOR_HAVE_URING_WAITID
+			/* The kernel writes a WAITID's siginfo even when it cancels it,
+			 * and the ring's own teardown cancels asynchronously: cancel it
+			 * now, which returns once it completed (or finds it done). */
+			if (wait->kind == IOR_URING_WAIT_WAITID) {
+				struct io_uring_sync_cancel_reg reg;
+				memset(&reg, 0, sizeof(reg));
+				reg.addr = (uint64_t) (uintptr_t) wait;
+				reg.timeout.tv_sec = -1;
+				reg.timeout.tv_nsec = -1;
+				(void) io_uring_register_sync_cancel(&ctx->ring, &reg);
+			}
+#endif
+			if (wait->fd >= 0) {
+				close(wait->fd);
+			}
 			free(wait);
 			wait = next;
 		}
@@ -1535,6 +1738,7 @@ static ior_uring_wait *ior_uring_wait_new(ior_ctx_uring *ctx, struct io_uring_sq
 	if (!wait) {
 		return NULL;
 	}
+	wait->kind = IOR_URING_WAIT_PIDFD;
 	wait->fd = fd;
 	wait->ksqe = s;
 	io_uring_prep_poll_add(s, fd, POLLIN);
@@ -1564,35 +1768,55 @@ static int ior_uring_backend_prep_sigwait(
 		close(sfd);
 		return -ENOMEM;
 	}
-	wait->is_sig = 1;
+	wait->kind = IOR_URING_WAIT_SIG;
 	wait->info = info;
 	return 0;
 }
 
-// A worker's waitpid(2), for what a pidfd poll cannot express.
+// Never run: a probed wait's job goes to the timer, not to a worker.
 static int32_t ior_uring_waitpid_job(ior_work_token *token, void *arg)
 {
 	(void) token;
-	ior_uring_job *job = arg;
-	pid_t r;
-	do {
-		r = waitpid(job->wait_pid, job->wait_status, job->wait_options);
-	} while (r < 0 && errno == EINTR);
-	return r < 0 ? -errno : r;
+	(void) arg;
+	return -EINVAL;
 }
 
 /*
- * One child with nothing else asked gets a pidfd poll, which ties up no
- * thread and cancels natively; anything else (any child, a group, WNOHANG,
- * job control, no pidfd) is a worker's waitpid. Nothing is consumed here:
- * prep has no completion to carry an answer, and an op that is never
- * submitted, or fails to prep, must leave the child as it found it.
+ * Every wait the kernel can do goes to IORING_OP_WAITID where it has one
+ * (6.7): no thread, and a cancel or a link timeout takes it back without
+ * reaping. Otherwise one child with nothing else asked gets a pidfd poll,
+ * which does the same, and anything else (any child, a group, WNOHANG, job
+ * control, no pidfd) is probed from the timer thread (see
+ * ior_uring_probe_fired). Nothing is consumed here: prep has no completion
+ * to carry an answer, and an op that is never submitted, or fails to prep,
+ * must leave the child as it found it.
  */
 static int ior_uring_backend_prep_waitpid(
 		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
 {
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_sqe *s = &sqe->uring.sqe;
+
+#ifdef IOR_HAVE_URING_WAITID
+	if (ctx->has_waitid && pid != INT_MIN) {
+		// waitpid's pid as waitid's: 0 is the caller's own group.
+		idtype_t idtype = pid > 0 ? P_PID : pid == -1 ? P_ALL : P_PGID;
+		id_t id = pid > 0 ? (id_t) pid : pid < -1 ? (id_t) -pid : 0;
+		ior_uring_wait *wait = calloc(1, sizeof(*wait));
+		if (!wait) {
+			return -ENOMEM;
+		}
+		wait->kind = IOR_URING_WAIT_WAITID;
+		wait->fd = -1;
+		wait->status = status;
+		wait->ksqe = s;
+		// WUNTRACED is WSTOPPED; waitid asks for exits explicitly.
+		io_uring_prep_waitid(s, idtype, id, &wait->si, options | WEXITED, 0);
+		wait->next = ctx->waits_pending;
+		ctx->waits_pending = wait;
+		return 0;
+	}
+#endif
 
 #ifdef IOR_HAVE_PIDFD_OPEN
 	if (pid > 0 && options == 0) {
@@ -1629,6 +1853,8 @@ static int ior_uring_backend_prep_waitpid(
 	job->wait_pid = pid;
 	job->wait_status = status;
 	job->wait_options = options;
+	job->probe = 1;
+	job->probe_ns = IOR_WAITPID_PROBE_MIN_NS;
 	return 0;
 }
 

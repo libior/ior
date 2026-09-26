@@ -21,6 +21,7 @@
 #cmakedefine IOR_HAVE_ACCEPT4
 #cmakedefine IOR_HAVE_PREADV2
 #cmakedefine IOR_HAVE_PIDFD_OPEN
+#cmakedefine IOR_HAVE_URING_WAITID
 #cmakedefine IOR_HAVE_SIGTIMEDWAIT
 
 /* Build options */

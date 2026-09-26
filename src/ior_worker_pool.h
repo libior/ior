@@ -149,6 +149,15 @@ void ior_worker_pool_thread_stats(ior_worker_pool *pool, uint32_t *active, uint3
 uint64_t ior_worker_pool_monotonic_ns(void);
 
 /*
+ * A process wait that nothing can wake (any child, a process group, stop and
+ * continue reports, no process watch) is probed with waitpid(WNOHANG) from
+ * the timer thread instead of holding a worker: first at once, then at
+ * intervals doubling from the minimum up to the maximum.
+ */
+#define IOR_WAITPID_PROBE_MIN_NS 1000000ULL
+#define IOR_WAITPID_PROBE_MAX_NS 20000000ULL
+
+/*
  * The CLOCK_MONOTONIC deadline a timeout names: now plus ts for a relative
  * one, ts itself for an absolute one on the monotonic clock, and for one on
  * another clock (IOR_TIMEOUT_BOOTTIME, IOR_TIMEOUT_REALTIME) the monotonic

@@ -25,15 +25,6 @@
 #define MAX_KIDS 8
 #define MAX_TAG (0x8 + MAX_KIDS)
 
-/* A wait for one child parks without a thread on these platforms, so it is
- * cancellable and a link timeout takes effect at its deadline. Elsewhere a
- * worker blocks in waitpid() until the child exits. */
-#if defined(_WIN32) || defined(IOR_HAVE_KQUEUE) || defined(IOR_HAVE_PIDFD_OPEN)
-#define WAIT_IS_WATCHED 1
-#else
-#define WAIT_IS_WATCHED 0
-#endif
-
 typedef struct kid {
 	ior_pid_t pid;
 	int code;
@@ -343,26 +334,18 @@ static void test_waitpid_link_timeout(void **state)
 
 	uint64_t start = test_monotonic_now_ns();
 	reap_tags(s->ctx, 2, res, 5);
-	if (WAIT_IS_WATCHED) {
-		assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
-		assert_int_equal(res[(uintptr_t) TAG_TMO], -ETIME);
-		assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
-	} else {
-		// The worker's waitpid() cannot be stopped: the timeout completed
-		// at the deadline, the wait once the child exited.
-		assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
-		assert_int_equal(res[(uintptr_t) TAG_TMO], -EALREADY);
-		k->reaped = 1;
-	}
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
+	assert_int_equal(res[(uintptr_t) TAG_TMO], -ETIME);
+	assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
 }
 
 #ifndef _WIN32
 /*
- * A wait that holds a worker (WUNTRACED is never watched) cannot be stopped,
- * but its link timeout still completes at the deadline, with -EALREADY; the
- * wait completes once the child exits.
+ * A wait nothing can wake (WUNTRACED is never watched) holds no worker, so
+ * its link timeout cancels it at the deadline, and the child it was waiting
+ * for is left to be collected.
  */
-static void test_waitpid_link_timeout_blocking(void **state)
+static void test_waitpid_link_timeout_unwatched(void **state)
 {
 	wp_state *s = (wp_state *) *state;
 	int status = -1;
@@ -378,13 +361,15 @@ static void test_waitpid_link_timeout_blocking(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 
 	int32_t res[MAX_TAG];
-	reap_tags(s->ctx, 1, res, 5);
-	assert_int_equal(res[(uintptr_t) TAG_TMO], -EALREADY);
+	reap_tags(s->ctx, 2, res, 5);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
+	assert_int_equal(res[(uintptr_t) TAG_TMO], -ETIME);
 	assert_true(test_monotonic_now_ns() - start < 400000000ULL);
+	assert_int_equal(status, -1);
 
-	reap_tags(s->ctx, 1, res, 5);
-	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
-	check_reaped(s, res[(uintptr_t) TAG_WAIT], status);
+	assert_int_equal(waitpid(k->pid, &status, 0), k->pid);
+	k->reaped = 1;
+	assert_exited(k, status);
 }
 #endif
 
@@ -401,11 +386,7 @@ static void test_waitpid_pending_at_exit(void **state)
 	uint64_t start = test_monotonic_now_ns();
 	ior_queue_exit(s->ctx);
 	s->ctx = NULL;
-	if (WAIT_IS_WATCHED) {
-		assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
-	} else {
-		k->reaped = 1; // the worker's waitpid() collected it before exit
-	}
+	assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
 }
 
 // A process that is not a child of ours: -ECHILD at once, however long it
@@ -486,14 +467,18 @@ static void test_waitpid_any(void **state)
 	assert_ptr_not_equal(a, b);
 }
 
-// A -1 wait holds a worker in waitpid(): a cancel finds it running.
+/*
+ * A cancelled wait for any child takes nothing: it holds no worker, so the
+ * cancel claims it (0), and the child it would have reaped is left to be
+ * collected.
+ */
 static void test_waitpid_any_cancel(void **state)
 {
 	wp_state *s = (wp_state *) *state;
 	int32_t res[MAX_TAG];
 	int status = -1;
 
-	kid *k = spawn_child(s, 4, 400);
+	kid *k = spawn_child(s, 4, 300);
 	submit_wait(s, -1, &status, 0, TAG_WAIT, 0);
 	assert_true(ior_submit(s->ctx) >= 0);
 	sleep_ms(50);
@@ -505,14 +490,79 @@ static void test_waitpid_any_cancel(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 
 	reap_tags(s->ctx, 2, res, 3);
-	if (res[(uintptr_t) TAG_CANCEL] == 0) {
-		// Caught before the worker picked it up.
-		assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
-		return;
-	}
-	assert_int_equal(res[(uintptr_t) TAG_CANCEL], -EALREADY);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
+	assert_int_equal(status, -1);
+
+	assert_int_equal(waitpid(k->pid, &status, 0), k->pid);
+	k->reaped = 1;
+	assert_exited(k, status);
+}
+
+/* A wait for stop and continue reports sees the child stop, then resume. */
+static void test_waitpid_stopped_continued(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int32_t res[MAX_TAG];
+	int status = -1;
+
+	kid *k = spawn_child(s, 0, 5000);
+	submit_wait(s, -1, &status, WUNTRACED, TAG_WAIT, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	sleep_ms(50);
+	kill(k->pid, SIGSTOP);
+	reap_tags(s->ctx, 1, res, 3);
 	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+	assert_true(WIFSTOPPED(status));
+	assert_int_equal(WSTOPSIG(status), SIGSTOP);
+
+	status = -1;
+	submit_wait(s, k->pid, &status, WCONTINUED, TAG_WAIT2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	sleep_ms(50);
+	kill(k->pid, SIGCONT);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) k->pid);
+	assert_true(WIFCONTINUED(status));
+}
+
+/* A wait for a process group reaps the child that leads it. */
+static void test_waitpid_group(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int32_t res[MAX_TAG];
+	int status = -1;
+
+	kid *k = spawn_child(s, 6, 100);
+	assert_return_code(setpgid(k->pid, k->pid), 0);
+	submit_wait(s, -k->pid, &status, 0, TAG_WAIT, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
 	check_reaped(s, res[(uintptr_t) TAG_WAIT], status);
+}
+
+/*
+ * Teardown with a wait for any child pending does not wait for the child,
+ * and does not reap it.
+ */
+static void test_waitpid_any_at_exit(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+
+	kid *k = spawn_child(s, 2, 1500);
+	submit_wait(s, -1, NULL, 0, TAG_WAIT, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	sleep_ms(50);
+
+	uint64_t start = test_monotonic_now_ns();
+	ior_queue_exit(s->ctx);
+	s->ctx = NULL;
+	assert_true(test_monotonic_now_ns() - start < 500000000ULL);
+
+	int status;
+	assert_int_equal(waitpid(k->pid, &status, 0), k->pid);
+	k->reaped = 1;
+	assert_exited(k, status);
 }
 #endif
 
@@ -542,7 +592,10 @@ int main(int argc, char **argv)
 		cmocka_unit_test_setup_teardown(test_waitpid_signaled, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any_cancel, setup_wp, teardown_wp),
-		cmocka_unit_test_setup_teardown(test_waitpid_link_timeout_blocking, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_link_timeout_unwatched, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_stopped_continued, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_group, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_any_at_exit, setup_wp, teardown_wp),
 #endif
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
