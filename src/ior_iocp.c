@@ -4253,9 +4253,12 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 			op->drain_after = 0;
 		}
 
-		// Build LINK chain (prev is the predecessor if it had LINK set)
+		// Build LINK chain (prev is the predecessor if it had LINK set). An
+		// entry behind a paired link timeout hangs off the guarded op, as
+		// io_uring splices the timeout out of the link: it follows that op's
+		// result, not the timeout's -ECANCELED when the op finished first.
 		if (prev && (prev->sqe_flags & IOR_SQE_IO_LINK)) {
-			prev->link_next = op;
+			(prev->guarded ? prev->guarded : prev)->link_next = op;
 			op->linked_deferred = true;
 			atomic_store(&op->state, IOCP_OP_LINKED);
 		} else {

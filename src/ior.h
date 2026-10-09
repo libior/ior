@@ -738,6 +738,10 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *     does for a running request, and the guarded op completes with its own
  *     result once it ends. Its memory stays in use until then.
  *
+ * An entry linked behind this link timeout (IOR_SQE_IO_LINK on it) follows
+ * the guarded op, not the timeout: it runs once that op succeeds and is
+ * cancelled when that op fails, is cancelled or times out.
+ *
  * The deadline runs from submit. On the thread backend a work callback, a
  * signal wait or a process wait heading its chain is ended at the deadline
  * even while it still waits for a free worker, and a one-shot poll heading
