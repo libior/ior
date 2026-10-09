@@ -754,8 +754,9 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  * before its link timeout is armed. io_uring from 6.16 arms the link timeout
  * around the issue instead, so a zero one can fire while such a completion is
  * still being flushed and report -ENOENT, its cancel having found nothing
- * left. If the guarded op is cancelled with
- * ior_prep_cancel() instead, both it and this link timeout complete with
+ * left, or -ETIME, the completion having disarmed it just as it fired; the
+ * guarded op reports its result either way. If the guarded op is cancelled
+ * with ior_prep_cancel() instead, both it and this link timeout complete with
  * -ECANCELED.
  *
  * @p ts is read by the submit that takes the entry, as for ior_prep_timeout().
