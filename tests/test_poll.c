@@ -307,9 +307,7 @@ static void test_poll_link_timeout(void **state)
  * and the timeout, never armed, with -ECANCELED. io_uring (6.16 and later)
  * arms the timeout around the poll's issue, so a zero one can fire while the
  * poll's completion is still being flushed and find nothing to cancel:
- * -ENOENT. The thread backend ends a chain head whose deadline has passed
- * before a worker takes it (see ior_prep_link_timeout), so there the pair
- * may report the timeout instead.
+ * -ENOENT.
  */
 static void test_poll_ready_zero_link_timeout(void **state)
 {
@@ -354,18 +352,120 @@ static void test_poll_ready_zero_link_timeout(void **state)
 			}
 		}
 
-		ior_backend_type backend = ior_get_backend_type(s->ctx);
-		if (backend == IOR_BACKEND_THREADS && poll_res == -ECANCELED) {
-			assert_int_equal(lt_res, -ETIME);
-			continue;
-		}
 		assert_true(poll_res > 0);
 		assert_true(poll_res & IOR_POLL_IN);
-		if (backend == IOR_BACKEND_IOURING && lt_res == -ENOENT) {
+		if (ior_get_backend_type(s->ctx) == IOR_BACKEND_IOURING && lt_res == -ENOENT) {
 			continue;
 		}
 		assert_int_equal(lt_res, -ECANCELED);
 	}
+}
+
+/*
+ * A poll answered at submit splits its chain: the poll completes with its
+ * mask, its link timeout with -ECANCELED, and what is linked behind them (a
+ * nop) runs as a chain of its own.
+ */
+static void test_poll_ready_link_timeout_chain(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	ior_prep_write(s->ctx, w, s->sock[0], "x", 1, 0);
+	ior_sqe_set_data(s->ctx, w, WRITE_TAG(0));
+	assert_true(ior_submit_and_wait(s->ctx, 1) >= 0);
+	assert_int_equal(wait_res_for_tag(s->ctx, WRITE_TAG(0)), 1);
+
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000000LL };
+
+	ior_sqe *p = ior_get_sqe(s->ctx);
+	assert_non_null(p);
+	ior_prep_poll_add(s->ctx, p, s->sock[1], IOR_POLL_IN);
+	ior_sqe_set_flags(s->ctx, p, IOR_SQE_IO_LINK);
+	ior_sqe_set_data(s->ctx, p, POLL_TAG(0));
+
+	ior_sqe *lt = ior_get_sqe(s->ctx);
+	assert_non_null(lt);
+	ior_prep_link_timeout(s->ctx, lt, &ts, 0);
+	ior_sqe_set_flags(s->ctx, lt, IOR_SQE_IO_LINK);
+	ior_sqe_set_data(s->ctx, lt, POLL_TAG(1));
+
+	ior_sqe *nop = ior_get_sqe(s->ctx);
+	assert_non_null(nop);
+	ior_prep_nop(s->ctx, nop);
+	ior_sqe_set_data(s->ctx, nop, POLL_TAG(2));
+
+	assert_int_equal(ior_submit(s->ctx), 3);
+
+	int32_t poll_res = 0, lt_res = 0, nop_res = -1;
+	for (int i = 0; i < 3; i++) {
+		ior_cqe *cqe = NULL;
+		assert_return_code(ior_wait_cqe(s->ctx, &cqe), 0);
+		void *data = ior_cqe_get_data(s->ctx, cqe);
+		int32_t res = ior_cqe_get_res(s->ctx, cqe);
+		ior_cqe_seen(s->ctx, cqe);
+		if (data == POLL_TAG(0)) {
+			poll_res = res;
+		} else if (data == POLL_TAG(1)) {
+			lt_res = res;
+		} else {
+			assert_ptr_equal(data, POLL_TAG(2));
+			nop_res = res;
+		}
+	}
+
+	assert_true(poll_res > 0);
+	assert_true(poll_res & IOR_POLL_IN);
+	assert_int_equal(lt_res, -ECANCELED);
+	assert_int_equal(nop_res, 0);
+}
+
+/*
+ * A cancel submitted in the same batch as a poll of a ready descriptor finds
+ * nothing: the poll was answered at submit, before the cancel ran.
+ */
+static void test_poll_ready_cancel_same_batch(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	ior_prep_write(s->ctx, w, s->sock[0], "x", 1, 0);
+	ior_sqe_set_data(s->ctx, w, WRITE_TAG(0));
+	assert_true(ior_submit_and_wait(s->ctx, 1) >= 0);
+	assert_int_equal(wait_res_for_tag(s->ctx, WRITE_TAG(0)), 1);
+
+	ior_sqe *p = ior_get_sqe(s->ctx);
+	assert_non_null(p);
+	ior_prep_poll_add(s->ctx, p, s->sock[1], IOR_POLL_IN);
+	ior_sqe_set_data(s->ctx, p, POLL_TAG(0));
+
+	ior_sqe *c = ior_get_sqe(s->ctx);
+	assert_non_null(c);
+	ior_prep_cancel(s->ctx, c, POLL_TAG(0));
+	ior_sqe_set_data(s->ctx, c, POLL_TAG(1));
+
+	assert_int_equal(ior_submit(s->ctx), 2);
+
+	int32_t poll_res = 0, cancel_res = 0;
+	for (int i = 0; i < 2; i++) {
+		ior_cqe *cqe = NULL;
+		assert_return_code(ior_wait_cqe(s->ctx, &cqe), 0);
+		void *data = ior_cqe_get_data(s->ctx, cqe);
+		int32_t res = ior_cqe_get_res(s->ctx, cqe);
+		ior_cqe_seen(s->ctx, cqe);
+		if (data == POLL_TAG(0)) {
+			poll_res = res;
+		} else {
+			assert_ptr_equal(data, POLL_TAG(1));
+			cancel_res = res;
+		}
+	}
+
+	assert_true(poll_res > 0);
+	assert_true(poll_res & IOR_POLL_IN);
+	assert_int_equal(cancel_res, -ENOENT);
 }
 
 /* Closing the peer completes an IN poll (readable EOF and/or hangup). */
@@ -876,6 +976,10 @@ int main(void)
 				test_poll_link_timeout, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
 				test_poll_ready_zero_link_timeout, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_poll_ready_link_timeout_chain, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_poll_ready_cancel_same_batch, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
 				test_poll_peer_hangup, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test(test_poll_pending_at_exit),

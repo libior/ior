@@ -58,37 +58,6 @@ struct ior_threads_poller {
 	size_t pfds_cap;
 };
 
-static short ior_poller_to_poll(uint32_t ior_mask)
-{
-	short ev = 0;
-	if (ior_mask & IOR_POLL_IN) {
-		ev |= POLLIN;
-	}
-	if (ior_mask & IOR_POLL_OUT) {
-		ev |= POLLOUT;
-	}
-	/* ERR/HUP/NVAL are output-only for poll(). */
-	return ev;
-}
-
-static uint32_t ior_poller_from_poll(short revents)
-{
-	uint32_t mask = 0;
-	if (revents & POLLIN) {
-		mask |= IOR_POLL_IN;
-	}
-	if (revents & POLLOUT) {
-		mask |= IOR_POLL_OUT;
-	}
-	if (revents & POLLERR) {
-		mask |= IOR_POLL_ERR;
-	}
-	if (revents & POLLHUP) {
-		mask |= IOR_POLL_HUP;
-	}
-	return mask;
-}
-
 /*
  * Stage r for completion with res on the done list (lock held). A retired
  * request has been unlinked and is freed after its callback; a multishot
@@ -225,12 +194,12 @@ static void ior_poller_resolve(ior_threads_poller *poller, int pret, ior_poller_
 			*pp = r->next;
 			ior_poller_stage(done, r, -EBADF, 1);
 		} else if (revents && r->multi) {
-			ior_poller_stage(done, r, (int) ior_poller_from_poll(revents), 0);
+			ior_poller_stage(done, r, (int) ior_threads_poller_from_poll(revents), 0);
 			r->rearm_ns = now + IOR_THREADS_POLLER_MULTI_REARM_NS;
 			pp = &r->next;
 		} else if (revents) {
 			*pp = r->next;
-			ior_poller_stage(done, r, (int) ior_poller_from_poll(revents), 1);
+			ior_poller_stage(done, r, (int) ior_threads_poller_from_poll(revents), 1);
 		} else if (r->deadline_ns && r->deadline_ns <= now) {
 			*pp = r->next;
 			ior_poller_stage(done, r, -ETIME, 1);
@@ -292,7 +261,7 @@ static void *ior_poller_thread(void *arg)
 		for (ior_poller_req *r = poller->active; r; r = r->next, i++) {
 			/* A negative fd keeps the slot but is ignored by poll(). */
 			poller->pfds[i].fd = r->rearm_ns ? -1 : r->fd;
-			poller->pfds[i].events = ior_poller_to_poll(r->mask);
+			poller->pfds[i].events = ior_threads_poller_to_poll(r->mask);
 			poller->pfds[i].revents = 0;
 		}
 		int timeout_ms = ior_poller_timeout_ms(poller);

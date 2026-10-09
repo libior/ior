@@ -43,6 +43,7 @@ static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, c
 static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res);
 static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self);
 static int ior_threads_pool_fd_ready(int fd, short events);
+static int32_t ior_threads_pool_poll_probe(const ior_work *w);
 static int ior_threads_pool_accept(
 		int fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags);
 static uint64_t ior_threads_pool_lt_deadline(const ior_work *lt);
@@ -951,6 +952,14 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 	 * An entry io_uring would refuse to take fails its whole chain, as there:
 	 * it completes with its own error and the rest with -ECANCELED. Submission
 	 * stops after it unless it links on, and what follows stays staged.
+	 *
+	 * A one-shot poll heading a chain is answered here if its descriptor is
+	 * ready already, as io_uring issues a poll at submit and completes a
+	 * ready one there: it never waits for a worker, its link timeout is
+	 * never armed, and the rest of its chain is queued as a chain of its
+	 * own. Submit's completions are posted once the batch is dispatched,
+	 * before the cancels run, so a cancel in the batch reports -ENOENT for
+	 * them.
 	 */
 	uint32_t consumed = atomic_load_explicit(&ctx->sq_ring.consumed, memory_order_relaxed);
 	uint32_t cached = atomic_load_explicit(&ctx->sq_ring.cached_tail, memory_order_acquire);
@@ -964,8 +973,10 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 	int prev_link = 0;
 	ior_work *head = NULL; // head of the chain being built
 	int chain_failed = 0;
-	ior_work *failed = NULL; // failed chains, linked by next through their heads
-	ior_work **failed_tail = &failed;
+	// Chains submit completes itself (failed, or headed by a ready poll), each
+	// op's result in fail_res; linked by next through their heads.
+	ior_work *settled = NULL;
+	ior_work **settled_tail = &settled;
 	ior_work *cancels = NULL;
 	ior_work *cancels_tail = NULL;
 	ior_work *timers = NULL; // standalone timeouts, armed below in order
@@ -1095,14 +1106,78 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 		}
 		prev = w;
 		prev_link = has_link;
-		if (chain_failed && (!has_link || p == cached)) {
+		if (has_link && p != cached) {
+			continue; // the chain goes on
+		}
+		if (chain_failed) {
 			head->next = NULL;
-			*failed_tail = head;
-			failed_tail = &head->next;
+			*settled_tail = head;
+			settled_tail = &head->next;
 			chain_failed = 0;
 			if (w->fail_res < 0 && !has_link) {
 				break;
 			}
+			continue;
+		}
+		/*
+		 * The chain is complete, so the head can be issued: a poll whose
+		 * descriptor is ready completes now, with its link timeout, and the
+		 * next op heads what remains, itself answered now if it is such a
+		 * poll too, as io_uring issues the next link at once. A poll of a bad
+		 * descriptor fails its chain, as a refused entry does.
+		 */
+		ior_work *h = head;
+		int32_t res;
+		while (h && (res = ior_threads_pool_poll_probe(h)) != 0) {
+			h->fail_res = res;
+			ior_work *rest = NULL;
+			if (res > 0) {
+				rest = h->chain;
+				if (rest && rest->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
+					ior_work *lt = rest;
+					lt->fail_res = -ECANCELED;
+					rest = lt->chain;
+					lt->chain = NULL;
+				} else {
+					h->chain = NULL;
+				}
+			}
+			h->next = NULL;
+			*settled_tail = h;
+			settled_tail = &h->next;
+			h = rest;
+		}
+		if (h == head) {
+			continue;
+		}
+		// The head is answered: off the FIFO and hidden from cancels, like
+		// a failed one, until it completes below.
+		atomic_store_explicit(&head->state, IOR_WORK_LINKED, memory_order_release);
+		last = before_head;
+		if (last) {
+			last->next = NULL;
+		} else {
+			first = NULL;
+		}
+		njobs--;
+		if (h) {
+			// What remains is a chain of its own, as if submitted now: its
+			// link timeout runs from here and is armed below if it guards
+			// an op that may hold its worker.
+			if (h->chain && h->chain->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT
+					&& !(h->sqe.threads.flags & IOR_SQE_IO_DRAIN)) {
+				h->deadline_ns = ior_threads_pool_lt_deadline(h->chain);
+			}
+			atomic_store_explicit(&h->state, IOR_WORK_QUEUED, memory_order_release);
+			h->job.next = NULL;
+			before_head = last;
+			if (last) {
+				last->next = &h->job;
+			} else {
+				first = &h->job;
+			}
+			last = &h->job;
+			njobs++;
 		}
 	}
 
@@ -1125,15 +1200,16 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 	// Staging slots are now free for reuse by get_sqe.
 	ior_threads_ring_consume_to(&ctx->sq_ring, p);
 
-	// Failed chains complete before the cancels run, as io_uring posts them.
-	// Their ops stay LINKED until then, so no cancel finds them.
+	// Submit's own completions (failed chains, ready polls) post before the
+	// cancels run, as io_uring posts them. Their ops stay LINKED until then,
+	// so no cancel finds them.
 	uint64_t done = 0;
-	while (failed) {
-		ior_work *w = failed;
-		failed = w->next;
+	while (settled) {
+		ior_work *w = settled;
+		settled = w->next;
 		for (ior_work *next; w; w = next) {
 			next = w->chain;
-			ior_threads_pool_finish_res(pool, w, w->fail_res < 0 ? w->fail_res : -ECANCELED);
+			ior_threads_pool_finish_res(pool, w, w->fail_res ? w->fail_res : -ECANCELED);
 			done++;
 		}
 	}
@@ -1401,6 +1477,43 @@ static int ior_threads_pool_fd_ready(int fd, short events)
 		pret = poll(&pfd, 1, 0);
 	} while (pret < 0 && errno == EINTR);
 	return pret != 0;
+}
+
+/*
+ * Submit's answer to a one-shot poll heading a complete chain: the
+ * descriptor's readiness right now, probed with poll(2) without waiting, as
+ * io_uring issues a poll at submit and completes a ready one there. Returns
+ * the ready mask (what was asked for, and ERR and HUP as the pollers report
+ * them), -EBADF for a descriptor poll(2) rejects, or 0 when the op is to wait
+ * on the poller: nothing ready, or a poll submit does not answer (multishot,
+ * drained, on a fixed file).
+ */
+static int32_t ior_threads_pool_poll_probe(const ior_work *w)
+{
+	const ior_sqe *sqe = &w->sqe;
+	if (sqe->threads.opcode != IOR_OP_POLL || (sqe->threads.len & IOR_POLL_ADD_MULTI)
+			|| (sqe->threads.flags & IOR_SQE_IO_DRAIN)
+			|| ior_fixed_file_bad(
+					sqe->threads.opcode, sqe->threads.flags, sqe->threads.cancel_flags)) {
+		return 0;
+	}
+	struct pollfd pfd = {
+		.fd = sqe->threads.fd,
+		.events = ior_threads_poller_to_poll(sqe->threads.poll_events),
+	};
+	int pret;
+	do {
+		pret = poll(&pfd, 1, 0);
+	} while (pret < 0 && errno == EINTR);
+	if (pret <= 0) {
+		return 0;
+	}
+	if (pfd.revents & POLLNVAL) {
+		return -EBADF;
+	}
+	uint32_t ready = ior_threads_poller_from_poll(pfd.revents)
+			& (sqe->threads.poll_events | IOR_POLL_ERR | IOR_POLL_HUP);
+	return (int32_t) ready;
 }
 
 /* The timespec of a timer or link timeout op: the copy submit took, or NULL
@@ -2050,9 +2163,12 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		 * A chain head's deadline runs from submit. One still waiting for a
 		 * worker when it passed never starts, whatever it would find: a
 		 * socket with data already there as much as a file, as the timer
-		 * ends an op armed at submit (see ior_threads_pool_lt_fired). Not
-		 * an op the poller has found ready meanwhile: that readiness came
-		 * in time. A cancel that claimed it first is the result instead.
+		 * ends an op armed at submit (see ior_threads_pool_lt_fired). A
+		 * one-shot poll was decided earlier: one ready at submit never gets
+		 * here (see ior_threads_pool_notify), so this ends only a poll that
+		 * had to wait. Not an op the poller has found ready meanwhile: that
+		 * readiness came in time. A cancel that claimed it first is the
+		 * result instead.
 		 */
 		if (lt && w->deadline_ns && !w->arb && !w->ready
 				&& ior_worker_pool_monotonic_ns() >= w->deadline_ns) {

@@ -740,11 +740,13 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *
  * The deadline runs from submit. On the thread backend a work callback, a
  * signal wait or a process wait heading its chain is ended at the deadline
- * even while it still waits for a free worker. Any other op (a read, a
- * write, a send or a receive) only learns whether it can wait without its
- * worker once one takes it, so one still waiting for a worker at its
- * deadline is ended then, late: it never starts, completing with
- * -ECANCELED and this link timeout with -ETIME.
+ * even while it still waits for a free worker, and a one-shot poll heading
+ * its chain is answered at submit if its descriptor is ready then (see
+ * ior_prep_poll_add()), so this link timeout never arms and completes with
+ * -ECANCELED. Any other op (a read, a write, a send or a receive) only
+ * learns whether it can wait without its worker once one takes it, so one
+ * still waiting for a worker at its deadline is ended then, late: it never
+ * starts, completing with -ECANCELED and this link timeout with -ETIME.
  *
  * A read or write of a pollable descriptor (a socket, a pipe) waiting for
  * readiness is cancelled at the deadline; one of a regular file runs to
@@ -1064,11 +1066,14 @@ int ior_sigrequeue(const ior_siginfo_t *info);
  *
  * On the threads and IOCP backends all pending polls are multiplexed on a
  * single poller thread. On the IOCP backend only sockets are pollable; other
- * handles complete with -ENOTSOCK. A socket ready at submit completes there
- * at submit, as on io_uring, before its link timeout is armed: a zero link
- * timeout (a liveness check that must not wait) finds the poll done and
+ * handles complete with -ENOTSOCK.
+ *
+ * A descriptor ready at submit completes the poll there, on every backend:
+ * before anything submitted after it runs, so a cancel in the same submit
+ * finds it gone (-ENOENT), and before its link timeout is armed, so a zero
+ * link timeout (a liveness check that must not wait) finds the poll done and
  * completes with -ECANCELED (on io_uring possibly -ENOENT, see
- * ior_prep_link_timeout()).
+ * ior_prep_link_timeout()). A regular file is always ready.
  *
  * @param ctx        I/O context.
  * @param sqe        Entry from ior_get_sqe().

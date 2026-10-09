@@ -98,7 +98,13 @@ typedef struct ior_work {
 	ior_worker_pool_job job; // FIFO node while queued as a chain head
 	ior_sqe sqe; // copied submission entry
 	uint64_t seq; // submission order, for IO_DRAIN
-	int32_t fail_res; // submit: the entry's own error when its chain failed
+	/*
+	 * Submit's own result for an op it completes itself (see
+	 * ior_threads_pool_notify): the entry's error when its chain failed, or
+	 * the readiness of a poll found ready, and 0 for an op it cancels with
+	 * them. Meaningless once a chain reaches a worker.
+	 */
+	int32_t fail_res;
 	struct ior_work *next; // free-list link (scratch link while allocated)
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
 	/*

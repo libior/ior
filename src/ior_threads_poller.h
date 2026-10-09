@@ -3,6 +3,8 @@
 #define IOR_THREADS_POLLER_H
 
 #include "config.h"
+#include "ior.h"
+#include <poll.h>
 #include <stdint.h>
 
 /*
@@ -39,6 +41,42 @@ typedef struct ior_threads_poller ior_threads_poller;
  */
 #define IOR_THREADS_POLLER_MULTI (1U << 30)
 #define IOR_THREADS_POLLER_MULTI_REARM_NS 1000000ULL
+
+/*
+ * An IOR_POLL_* request mask as poll(2) events, for the poll(2) poller and
+ * the readiness probes the thread pool makes with poll(2) itself. ERR, HUP
+ * and NVAL are output-only for poll(2).
+ */
+static inline short ior_threads_poller_to_poll(uint32_t ior_mask)
+{
+	short ev = 0;
+	if (ior_mask & IOR_POLL_IN) {
+		ev |= POLLIN;
+	}
+	if (ior_mask & IOR_POLL_OUT) {
+		ev |= POLLOUT;
+	}
+	return ev;
+}
+
+/* The IOR_POLL_* mask of what poll(2) reported; POLLNVAL is for the caller. */
+static inline uint32_t ior_threads_poller_from_poll(short revents)
+{
+	uint32_t mask = 0;
+	if (revents & POLLIN) {
+		mask |= IOR_POLL_IN;
+	}
+	if (revents & POLLOUT) {
+		mask |= IOR_POLL_OUT;
+	}
+	if (revents & POLLERR) {
+		mask |= IOR_POLL_ERR;
+	}
+	if (revents & POLLHUP) {
+		mask |= IOR_POLL_HUP;
+	}
+	return mask;
+}
 
 /*
  * Completion callback, invoked on the poller thread with no poller lock held.
