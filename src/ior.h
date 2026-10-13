@@ -149,6 +149,9 @@ typedef struct ior_timespec {
 #define IOR_OP_WAITPID 15
 /** Wait for a signal (ior_prep_sigwait); completes with its number. */
 #define IOR_OP_SIGWAIT 16
+/** Wait for changes in a directory (ior_prep_dir_changes); completes with
+ *  the bytes of change records written. Windows only. */
+#define IOR_OP_DIR_CHANGES 17
 /** @} */
 
 /**
@@ -328,6 +331,8 @@ typedef enum {
  *  are available;
  *  otherwise the threads backend is used. */
 #define IOR_FEAT_WORK (1U << 5)
+/** Directory change ops are supported (ior_prep_dir_changes): IOCP only. */
+#define IOR_FEAT_DIR_CHANGES (1U << 6)
 /** @} */
 
 /**
@@ -1059,6 +1064,43 @@ int ior_sigismember(const ior_sigset_t *set, int signo);
  *         queueing it (-EAGAIN when the process has too many pending).
  */
 int ior_sigrequeue(const ior_siginfo_t *info);
+
+/** @p flags of ior_prep_dir_changes(): watch the whole subtree. */
+#define IOR_DIR_CHANGES_SUBTREE (1U << 0)
+
+/**
+ * Prepare a wait for changes in a directory (like ReadDirectoryChangesW()).
+ *
+ * Completes with the number of bytes written to @p buf as res: a chain of
+ * FILE_NOTIFY_INFORMATION records, linked by NextEntryOffset, for the names
+ * created, removed or renamed and the entries whose attributes, size, write,
+ * access or creation time or security changed. Changes of the directory
+ * itself are not reported. 0 means the records did not fit, the system's
+ * buffer or @p buf: changes were lost, and the caller enumerates the
+ * directory. -ECANCELED when cancelled.
+ *
+ * The first op on a handle starts the watch, and the system keeps the
+ * changes that come between ops in a buffer the size of that op's @p buf,
+ * for the handle's life. So every op on a handle uses the same @p flags and
+ * @p nbytes, and the next one follows each completion at once. The handle is a
+ * directory opened with FILE_LIST_DIRECTORY and FILE_FLAG_BACKUP_SEMANTICS |
+ * FILE_FLAG_OVERLAPPED; the op associates it with the context's completion
+ * port, as a read does (see ior_release_handle()).
+ *
+ * Windows only: other backends return -ENOTSUP, and report no
+ * IOR_FEAT_DIR_CHANGES.
+ *
+ * @param ctx     I/O context.
+ * @param sqe     Entry from ior_get_sqe().
+ * @param dir     The directory's handle.
+ * @param buf     Must be DWORD-aligned; valid until the completion arrives.
+ * @param nbytes  Size of @p buf, at most 64 KiB for a directory on a share.
+ * @param flags   IOR_DIR_CHANGES_SUBTREE or 0.
+ * @return 0 on success, -EINVAL for a NULL or unaligned @p buf, a zero
+ *         @p nbytes or an unknown flag, or -ENOTSUP.
+ */
+int ior_prep_dir_changes(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t dir, void *buf, unsigned nbytes, uint32_t flags);
 
 /**
  * Prepare a one-shot wait for fd readiness (like io_uring's POLL_ADD).

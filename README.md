@@ -45,6 +45,9 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Signal waits (`ior_prep_sigwait`): a signalfd poll on io_uring, a worker
   in `sigtimedwait` on the thread pool, the console control events
   (`SIGINT`, `SIGBREAK`) on Windows
+- Directory change waits (`ior_prep_dir_changes`, Windows only):
+  `ReadDirectoryChangesW` on the completion port, each completion with the
+  changes since the previous one; other backends refuse it with `-ENOTSUP`
 - Async cancellation of submitted operations (`ior_prep_cancel`,
   `ior_prep_cancel_fd`), with io_uring semantics on every backend
 - A completion notification descriptor (`ior_notify_fd`) for embedding a
@@ -359,6 +362,15 @@ int ior_sigismember(const ior_sigset_t *set, int signo);
 // its siginfo on Linux; offered to the pending sigwaits, else raise()d, on
 // Windows.
 int ior_sigrequeue(const ior_siginfo_t *info);
+
+// Wait for changes in a directory opened with FILE_LIST_DIRECTORY and
+// FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED (Windows only,
+// IOR_FEAT_DIR_CHANGES): completes with the bytes of FILE_NOTIFY_INFORMATION
+// records in buf, 0 when they did not fit and the caller rescans. Changes
+// between two ops are kept, in a buffer the size of the first op's buf. buf
+// must be DWORD-aligned (else -EINVAL). Elsewhere -ENOTSUP.
+int ior_prep_dir_changes(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t dir, void *buf,
+                         unsigned nbytes, uint32_t flags);
 
 // Splice operation (Linux only)
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,
